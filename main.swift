@@ -371,6 +371,11 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     
     private var pasteMonitor: Any?
     
+    // 淡出相关
+    private var fadeOutTimer: Timer?
+    /// 查询完成到彻底隐藏的总时长 (秒)
+    static let fadeOutTotalDuration: TimeInterval = 10.0
+    
     /// 粘贴内容长度上限 (超过视为不合理, 不自动查询)
     static let maxPasteLength: Int = 64
     
@@ -600,6 +605,8 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         guard !word.isEmpty else { return }
         
         Logger.shared.log("View: 查询单词 '\(word)'")
+        // 查询开始, 取消任何进行中的淡出 (窗口保持完全可见, 等查询返回再重新计时)
+        cancelFadeOut()
         // 记录本次查询实际提交到输入框里的原始字符串, 供 controlTextDidChange 识别
         // "用户是否在已有结果后继续键入" 以便触发覆盖逻辑.
         displayedWord = searchField.stringValue
@@ -664,6 +671,8 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         
         // 根据释义内容自适应调整窗口高度
         adjustWindowHeightForContent()
+        // 查询成功, 启动 10 秒淡出倒计时
+        startFadeOutCountdown()
         
         if let cachedData = data.cachedAudioData {
             Logger.shared.log("View: 使用缓存音频 \(cachedData.count) bytes")
@@ -705,6 +714,59 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         resizeWindowKeepingTop(to: contentAreaHeight)
         
         Logger.shared.log("View: 自适应高度 - 文本高度: \(contentHeight), scrollView: \(clampedHeight), 窗口内容区: \(contentAreaHeight)")
+    }
+    
+    // MARK: 查询完成后 10 秒淡出
+    
+    /// (重新) 启动淡出: alpha 1.0 -> 0.0 over `fadeOutTotalDuration`, 末尾 orderOut
+    func startFadeOutCountdown() {
+        cancelFadeOut()
+        guard let window = view.window, window.isVisible else { return }
+        
+        // 确保起点是完全不透明
+        window.alphaValue = 1.0
+        
+        Logger.shared.log("View: 启动 \(DictionaryViewController.fadeOutTotalDuration)s 淡出倒计时")
+        
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = DictionaryViewController.fadeOutTotalDuration
+            ctx.timingFunction = CAMediaTimingFunction(name: .linear)
+            ctx.allowsImplicitAnimation = true
+            window.animator().alphaValue = 0.0
+        }, completionHandler: nil)
+        
+        // 用独立 Timer 决定何时真正 orderOut (动画 completionHandler 在被取消时
+        // 也会触发, 不适合用它判断 "完整走完")
+        fadeOutTimer = Timer.scheduledTimer(withTimeInterval: DictionaryViewController.fadeOutTotalDuration,
+                                            repeats: false) { [weak self] _ in
+            self?.finishFadeOut()
+        }
+    }
+    
+    /// 取消正在进行的淡出, 将窗口恢复至完全不透明
+    func cancelFadeOut() {
+        if fadeOutTimer != nil {
+            Logger.shared.log("View: 取消淡出倒计时")
+        }
+        fadeOutTimer?.invalidate()
+        fadeOutTimer = nil
+        
+        guard let window = view.window else { return }
+        // 立即停止进行中的 alpha 动画, 把 alpha 直接设为 1
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0
+            window.animator().alphaValue = 1.0
+        }, completionHandler: nil)
+        window.alphaValue = 1.0
+    }
+    
+    /// 淡出计时结束: 彻底隐藏窗口, alpha 恢复 1.0 以便下次 orderFront 即可看到
+    private func finishFadeOut() {
+        fadeOutTimer = nil
+        guard let window = view.window else { return }
+        Logger.shared.log("View: 淡出结束, 隐藏窗口")
+        window.orderOut(nil)
+        window.alphaValue = 1.0
     }
     
     /// 调整窗口高度，同时保持窗口顶部位置不变
@@ -775,6 +837,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         let attr = NSAttributedString(string: message, attributes: attributes)
         definitionsTextView.textStorage?.setAttributedString(attr)
         adjustWindowHeightForContent()
+        startFadeOutCountdown()
     }
     
     /// "未找到" 状态: 居中灰色提示 + 可点击的拼写建议列表
@@ -840,6 +903,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         
         definitionsTextView.textStorage?.setAttributedString(result)
         adjustWindowHeightForContent()
+        startFadeOutCountdown()
     }
     
     // MARK: NSTextViewDelegate
@@ -889,7 +953,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     }
     
     /// 隐藏结果展示区 (不触碰 searchField 内容), 并把窗口收回到仅搜索框的高度.
+    /// 同时取消正在进行的淡出 —— 用户正在编辑意味着希望窗口继续可见.
     func hideResultArea() {
+        cancelFadeOut()
         hasSearched = false
         displayedWord = ""
         wordLabel.isHidden = true
@@ -906,7 +972,14 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var statusItem: NSStatusItem!
-    var hotKey: EventHotKeyRef?
+    
+    // 双击 Right Command 检测
+    private var rightCmdLastPressAt: TimeInterval = 0
+    private var rightCmdWasDown: Bool = false
+    private var globalFlagsMonitor: Any?
+    private var localFlagsMonitor: Any?
+    /// 双击判定的最大时间间隔 (秒)
+    private static let doubleTapWindow: TimeInterval = 0.35
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         Logger.shared.log("App: applicationDidFinishLaunching")
@@ -917,8 +990,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupWindow()
         Logger.shared.log("App: 窗口已设置 - frame: \(window.frame)")
         
-        registerGlobalHotKey()
-        Logger.shared.log("App: 全局快捷键已注册 (Cmd+Shift+D)")
+        checkAccessibilityPermission()
+        installRightCommandDoubleTapMonitor()
         
         // 定位窗口到屏幕顶部 (菜单栏正下方)
         positionWindowAtTop()
@@ -926,6 +999,62 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
         Logger.shared.log("App: 窗口已显示 - isVisible: \(window.isVisible), frame: \(window.frame)")
+    }
+    
+    /// 首次启动检查辅助功能权限; 未授权则弹系统原生引导窗并在日志提示
+    func checkAccessibilityPermission() {
+        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        let options: CFDictionary = [promptKey: true] as CFDictionary
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        if trusted {
+            Logger.shared.log("App: 辅助功能权限已授予")
+        } else {
+            Logger.shared.log("⚠️ App: 辅助功能权限未授予, 双击 Right Command 全局快捷键无法工作.")
+            Logger.shared.log("⚠️ App: 请在 系统偏好设置 → 安全性与隐私 → 隐私 → 辅助功能 中勾选 swift-dict, 然后重启应用.")
+        }
+    }
+    
+    /// 安装全局 + 本地 flagsChanged 监听, 实现 "双击 Right Command 唤起/隐藏"
+    func installRightCommandDoubleTapMonitor() {
+        globalFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            self?.processFlagsChanged(event)
+        }
+        // local monitor 让窗口自身处于前台时也能响应 (全局监听不触发自家应用的事件)
+        localFlagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            self?.processFlagsChanged(event)
+            return event
+        }
+        Logger.shared.log("App: 双击 Right Command 监听已安装")
+    }
+    
+    /// HID key code: 左 Command = 55, 右 Command = 54
+    private static let rightCommandKeyCode: UInt16 = 54
+    
+    private func processFlagsChanged(_ event: NSEvent) {
+        // flagsChanged 事件的 keyCode 表示 "刚刚发生变化的那个修饰键". 仅关心右 Cmd.
+        guard event.keyCode == AppDelegate.rightCommandKeyCode else { return }
+        
+        // 对右 Cmd 来说: 按下事件 modifierFlags 含 .command, 释放事件不含.
+        // (用户同时按下左右 Cmd 的极端场景不做处理, 不影响常规双击识别)
+        let isDown = event.modifierFlags.contains(.command)
+        
+        // 只在 "从释放 -> 按下" 的瞬间做判定
+        if isDown && !rightCmdWasDown {
+            rightCmdWasDown = true
+            let now = Date().timeIntervalSince1970
+            let delta = now - rightCmdLastPressAt
+            if delta <= AppDelegate.doubleTapWindow {
+                rightCmdLastPressAt = 0  // 清零, 避免三连击误判
+                Logger.shared.log("App: 检测到双击 Right Command (Δ=\(String(format: "%.3f", delta))s)")
+                DispatchQueue.main.async { [weak self] in
+                    self?.toggleWindow()
+                }
+            } else {
+                rightCmdLastPressAt = now
+            }
+        } else if !isDown {
+            rightCmdWasDown = false
+        }
     }
     
     /// 将窗口水平居中并紧贴系统菜单栏下方
@@ -941,6 +1070,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationWillTerminate(_ notification: Notification) {
         Logger.shared.log("App: 应用退出")
+        if let m = globalFlagsMonitor { NSEvent.removeMonitor(m) }
+        if let m = localFlagsMonitor { NSEvent.removeMonitor(m) }
     }
     
     func setupStatusItem() {
@@ -973,45 +1104,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 不使用 setFrameAutosaveName, 否则会恢复上次位置/大小, 破坏 "顶部固定 + 自适应高度" 行为
     }
     
-    func registerGlobalHotKey() {
-        var hotKeyID = EventHotKeyID()
-        hotKeyID.signature = OSType(0x44495354)
-        hotKeyID.id = 1
-        
-        let modifiers: UInt32 = UInt32(cmdKey | shiftKey)
-        let keyCode: UInt32 = 2
-        
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        let handlerRef = Unmanaged.passUnretained(self).toOpaque()
-        
-        InstallEventHandler(GetApplicationEventTarget(), { (_, event, userData) -> OSStatus in
-            guard let userData = userData else { return OSStatus(noErr) }
-            let app = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-            app.toggleWindow()
-            return noErr
-        }, 1, &eventType, handlerRef, nil)
-        
-        let status = RegisterEventHotKey(keyCode, modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKey)
-        
-        if status == noErr {
-            Logger.shared.log("App: 全局快捷键注册成功")
-        } else {
-            Logger.shared.error("App: 全局快捷键注册失败", error: nil)
-        }
-    }
-    
-    func unregisterGlobalHotKey() {
-        if let hotKey = hotKey {
-            UnregisterEventHotKey(hotKey)
-        }
-    }
-    
     @objc func toggleWindow() {
         if window.isVisible {
             Logger.shared.log("App: 隐藏窗口")
+            // 窗口可能正在淡出 (alpha 已经变小但仍 isVisible), 此时也视为可见, 立即彻底隐藏
+            if let vc = window.contentViewController as? DictionaryViewController {
+                vc.cancelFadeOut()
+            }
             window.orderOut(nil)
+            window.alphaValue = 1.0  // 为下次唤起准备
         } else {
             Logger.shared.log("App: 显示窗口 - frame: \(window.frame)")
+            window.alphaValue = 1.0  // 清除上次淡出残留
             positionWindowAtTop()
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
@@ -1020,6 +1124,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if let vc = window.contentViewController as? DictionaryViewController {
                 DispatchQueue.main.async {
                     vc.searchField.becomeFirstResponder()
+                    // 如果搜索框已有内容 (上次查询的单词), 全选以便用户直接覆盖输入
+                    if !vc.searchField.stringValue.isEmpty,
+                       let editor = vc.searchField.currentEditor() {
+                        editor.selectAll(nil)
+                    }
                 }
             }
             

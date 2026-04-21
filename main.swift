@@ -1038,6 +1038,70 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     }
 }
 
+// MARK: - Main Menu
+
+/// 构造最小可用的 mainMenu. accessory app (LSUIElement) 的 mainMenu 不会在
+/// 系统菜单栏中渲染, 但 AppKit 的快捷键分发链路依然依赖它: 按下 Cmd+A/Z/X/C/V
+/// 时, AppKit 会遍历 mainMenu 查找匹配的 keyEquivalent, 命中后再沿响应链
+/// (field editor -> NSTextView -> NSWindow) 调用对应 action selector.
+///
+/// 关键: 菜单项 target=nil, 让 action 走响应链; 这样不论焦点在 searchField
+/// (NSTextField 的 field editor) 还是 definitionsTextView (NSTextView),
+/// 标准编辑命令都能被正确响应.
+enum MainMenuBuilder {
+    static func build() -> NSMenu {
+        let mainMenu = NSMenu()
+        
+        // 顶级 "应用" 菜单 (即便只在快捷键分发中使用也保留, 便于未来扩展 Cmd+Q)
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        let quitItem = NSMenuItem(
+            title: "退出 \(AppInfo.displayName)",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quitItem.keyEquivalentModifierMask = [.command]
+        appMenu.addItem(quitItem)
+        appMenuItem.submenu = appMenu
+        
+        // "编辑" 菜单: 标准编辑命令. action 走响应链 (target=nil).
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "编辑")
+        
+        let undo = NSMenuItem(title: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        undo.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(undo)
+        
+        let redo = NSMenuItem(title: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redo)
+        
+        editMenu.addItem(NSMenuItem.separator())
+        
+        let cut = NSMenuItem(title: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        cut.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(cut)
+        
+        let copy = NSMenuItem(title: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        copy.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(copy)
+        
+        let paste = NSMenuItem(title: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        paste.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(paste)
+        
+        let selectAll = NSMenuItem(title: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        selectAll.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(selectAll)
+        
+        editMenuItem.submenu = editMenu
+        
+        return mainMenu
+    }
+}
+
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1054,6 +1118,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         Logger.shared.log("App: applicationDidFinishLaunching")
+        
+        // 安装 mainMenu: 即便是 accessory 模式 (菜单栏不渲染), AppKit 仍依赖
+        // mainMenu 的 keyEquivalent 来分发 Cmd+A/Z/X/C/V 等标准编辑快捷键.
+        // 没有这套菜单时, selectAll: / undo: / redo: 在文本控件里不会生效.
+        NSApp.mainMenu = MainMenuBuilder.build()
+        Logger.shared.log("App: mainMenu 已安装 (Edit 菜单快捷键分发就绪)")
         
         setupStatusItem()
         Logger.shared.log("App: 状态栏图标已设置")
@@ -1282,9 +1352,10 @@ app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
 
-// Note: accessory app 不会在系统菜单栏渲染 app.mainMenu, 因此这里不构建主菜单.
+// Note: accessory app 不会在系统菜单栏渲染 app.mainMenu, 但 AppKit 的快捷键
+// 分发链路仍依赖 mainMenu 的 keyEquivalent. 具体构建见 MainMenuBuilder,
+// 在 AppDelegate.applicationDidFinishLaunching 中安装.
 // 状态栏右键菜单 (关于/退出) 由 AppDelegate.showStatusItemMenu() 动态生成.
-// 文本框内的 Cmd+X/C/V/A 依然通过 NSText 默认响应链工作, 无需 mainMenu.
 
 // 命令行参数支持
 let args = CommandLine.arguments

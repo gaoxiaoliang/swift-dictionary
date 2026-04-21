@@ -195,6 +195,24 @@ struct YoudaoResult {
     var definitions: [String] = []
 }
 
+/// 拼写建议 (词条未收录时由有道返回的 typos.typo)
+struct TypoSuggestion {
+    let word: String
+    let trans: String
+}
+
+/// API 查询错误类型, 用于驱动 UI 展示不同文案
+enum DictionaryQueryError: Error {
+    /// 未收录该词条, 但 API 给出了候选拼写建议
+    case notFoundWithSuggestions(input: String, suggestions: [TypoSuggestion])
+    /// 未收录该词条, 且没有任何候选
+    case notFound(input: String)
+    /// 网络层错误 (无连接 / 超时 / DNS 等)
+    case network(underlying: Error)
+    /// 响应数据结构异常 (服务器返回非预期 JSON)
+    case invalidResponse
+}
+
 // MARK: - Youdao API
 
 class YoudaoAPI {
@@ -230,23 +248,35 @@ class YoudaoAPI {
         URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
                 Logger.shared.error("API: 网络错误", error: error)
-                completion(.failure(error))
+                completion(.failure(DictionaryQueryError.network(underlying: error)))
                 return
             }
             
             guard let data = data else {
                 Logger.shared.error("API: 无数据", error: nil)
-                completion(.failure(NSError(domain: "No data", code: -1)))
+                completion(.failure(DictionaryQueryError.invalidResponse))
                 return
             }
             
             do {
-                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let ec = json["ec"] as? [String: Any],
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    Logger.shared.error("API: JSON 根节点不是 object", error: nil)
+                    completion(.failure(DictionaryQueryError.invalidResponse))
+                    return
+                }
+                
+                // 未收录: ec.word 缺失时, 优先返回拼写建议 (typos.typo)
+                guard let ec = json["ec"] as? [String: Any],
                       let wordArray = ec["word"] as? [[String: Any]],
                       let wordData = wordArray.first else {
-                    Logger.shared.error("API: 解析失败", error: nil)
-                    completion(.failure(NSError(domain: "Parse error", code: -1)))
+                    let suggestions = Self.parseTypoSuggestions(from: json)
+                    if suggestions.isEmpty {
+                        Logger.shared.log("API: 未找到 '\(word)' 且无拼写建议")
+                        completion(.failure(DictionaryQueryError.notFound(input: word)))
+                    } else {
+                        Logger.shared.log("API: 未找到 '\(word)', 返回 \(suggestions.count) 个拼写建议")
+                        completion(.failure(DictionaryQueryError.notFoundWithSuggestions(input: word, suggestions: suggestions)))
+                    }
                     return
                 }
                 
@@ -301,15 +331,28 @@ class YoudaoAPI {
                 completion(.success(result))
             } catch {
                 Logger.shared.error("API: JSON解析错误", error: error)
-                completion(.failure(error))
+                completion(.failure(DictionaryQueryError.invalidResponse))
             }
         }.resume()
+    }
+    
+    /// 从有道 API 响应中解析 typos.typo[] 字段
+    private static func parseTypoSuggestions(from json: [String: Any]) -> [TypoSuggestion] {
+        guard let typos = json["typos"] as? [String: Any],
+              let list = typos["typo"] as? [[String: Any]] else {
+            return []
+        }
+        return list.compactMap { item in
+            guard let w = item["word"] as? String else { return nil }
+            let trans = (item["trans"] as? String) ?? ""
+            return TypoSuggestion(word: w, trans: trans)
+        }
     }
 }
 
 // MARK: - Dictionary View Controller
 
-class DictionaryViewController: NSViewController, NSTextFieldDelegate {
+class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextViewDelegate {
     var searchField: NSTextField!
     var wordLabel: NSTextField!
     var phoneticLabel: NSTextField!
@@ -402,6 +445,14 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
         definitionsTextView.textContainer?.containerSize = NSSize(width: textViewWidth, height: CGFloat.greatestFiniteMagnitude)
         definitionsTextView.textContainer?.widthTracksTextView = true
         definitionsTextView.textContainer?.lineFragmentPadding = 0
+        definitionsTextView.delegate = self
+        // 允许点击链接 (用于拼写建议)
+        definitionsTextView.isAutomaticLinkDetectionEnabled = false
+        definitionsTextView.linkTextAttributes = [
+            .foregroundColor: NSColor.linkColor,
+            .cursor: NSCursor.pointingHand,
+            .underlineStyle: NSUnderlineStyle.single.rawValue
+        ]
         scrollView.documentView = definitionsTextView
         view.addSubview(scrollView)
         
@@ -453,14 +504,35 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
         
         YoudaoAPI.shared.query(word: word) { [weak self] result in
             DispatchQueue.main.async {
-                self?.showLoading(false)
+                guard let self = self else { return }
+                self.showLoading(false)
                 switch result {
                 case .success(let data):
-                    self?.displayResult(data, word: word)
+                    self.displayResult(data, word: word)
                 case .failure(let error):
-                    self?.showError(error.localizedDescription)
+                    self.handleQueryError(error, forWord: word)
                 }
             }
+        }
+    }
+    
+    /// 分场景将 API 错误映射为对应的 UI 展示
+    func handleQueryError(_ error: Error, forWord word: String) {
+        if let apiError = error as? DictionaryQueryError {
+            switch apiError {
+            case .notFoundWithSuggestions(let input, let suggestions):
+                showNotFound(input: input, suggestions: suggestions)
+            case .notFound(let input):
+                showNotFound(input: input, suggestions: [])
+            case .network:
+                showPlaceholderMessage("网络连接失败，请稍后重试")
+            case .invalidResponse:
+                showPlaceholderMessage("查询失败，请稍后重试")
+            }
+        } else {
+            // 兜底: 非预期 Error 类型
+            Logger.shared.error("View: 未知错误类型 - \(error)", error: error)
+            showPlaceholderMessage("查询失败，请稍后重试")
         }
     }
     
@@ -480,7 +552,12 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
         playButton.isHidden = false
         
         Logger.shared.log("View: 释义内容: \(data.definitions)")
-        definitionsTextView.string = data.definitions.joined(separator: "\n")
+        let joined = data.definitions.joined(separator: "\n")
+        let defAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 14),
+            .foregroundColor: NSColor.labelColor
+        ]
+        definitionsTextView.textStorage?.setAttributedString(NSAttributedString(string: joined, attributes: defAttrs))
         
         // 根据释义内容自适应调整窗口高度
         adjustWindowHeightForContent()
@@ -577,13 +654,105 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
         }
     }
     
-    func showError(_ message: String) {
-        Logger.shared.error("View: 显示错误 - \(message)", error: nil)
+    /// 在释义区显示一条居中、灰色的占位/状态提示 (无拼写建议时使用)
+    func showPlaceholderMessage(_ message: String) {
+        Logger.shared.log("View: 显示提示 - \(message)")
         wordLabel.isHidden = true
         phoneticLabel.isHidden = true
         playButton.isHidden = true
-        definitionsTextView.string = message
+        hasSearched = true
+        
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 14),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: paragraph
+        ]
+        let attr = NSAttributedString(string: message, attributes: attributes)
+        definitionsTextView.textStorage?.setAttributedString(attr)
         adjustWindowHeightForContent()
+    }
+    
+    /// "未找到" 状态: 居中灰色提示 + 可点击的拼写建议列表
+    func showNotFound(input: String, suggestions: [TypoSuggestion]) {
+        Logger.shared.log("View: 未找到 '\(input)', 建议数=\(suggestions.count)")
+        wordLabel.isHidden = true
+        phoneticLabel.isHidden = true
+        playButton.isHidden = true
+        hasSearched = true
+        
+        let result = NSMutableAttributedString()
+        
+        let centerParagraph = NSMutableParagraphStyle()
+        centerParagraph.alignment = .center
+        centerParagraph.paragraphSpacing = 6
+        
+        let title = suggestions.isEmpty
+            ? "未找到「\(input)」的释义，请检查拼写"
+            : "未找到「\(input)」的释义，您是否想查："
+        let titleAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 14),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: centerParagraph
+        ]
+        result.append(NSAttributedString(string: title, attributes: titleAttrs))
+        
+        if !suggestions.isEmpty {
+            // 候选列表: 每行一个可点击链接, 下方附该词的简要翻译
+            let itemParagraph = NSMutableParagraphStyle()
+            itemParagraph.alignment = .center
+            itemParagraph.paragraphSpacing = 4
+            itemParagraph.paragraphSpacingBefore = 6
+            
+            let transParagraph = NSMutableParagraphStyle()
+            transParagraph.alignment = .center
+            transParagraph.paragraphSpacing = 8
+            
+            for sug in suggestions {
+                result.append(NSAttributedString(string: "\n", attributes: titleAttrs))
+                
+                // 建议词: 链接样式
+                let linkURL = URL(string: "spell-suggest://\(sug.word.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sug.word)")!
+                let linkAttrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 15, weight: .medium),
+                    .foregroundColor: NSColor.linkColor,
+                    .link: linkURL,
+                    .paragraphStyle: itemParagraph
+                ]
+                result.append(NSAttributedString(string: sug.word, attributes: linkAttrs))
+                
+                // 翻译 (若有)
+                if !sug.trans.isEmpty {
+                    result.append(NSAttributedString(string: "\n", attributes: titleAttrs))
+                    let transAttrs: [NSAttributedString.Key: Any] = [
+                        .font: NSFont.systemFont(ofSize: 12),
+                        .foregroundColor: NSColor.tertiaryLabelColor,
+                        .paragraphStyle: transParagraph
+                    ]
+                    result.append(NSAttributedString(string: sug.trans, attributes: transAttrs))
+                }
+            }
+        }
+        
+        definitionsTextView.textStorage?.setAttributedString(result)
+        adjustWindowHeightForContent()
+    }
+    
+    // MARK: NSTextViewDelegate
+    
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        guard let url = link as? URL, url.scheme == "spell-suggest" else {
+            return false
+        }
+        let word = (url.host ?? "").removingPercentEncoding ?? (url.host ?? "")
+        guard !word.isEmpty else { return false }
+        
+        Logger.shared.log("View: 点击拼写建议 '\(word)'")
+        searchField.stringValue = word
+        lastInputLength = word.count
+        searchWordAction()
+        return true
     }
     
     /// 清空显示内容, 将窗口恢复到初始 (仅搜索框) 高度
@@ -809,7 +978,23 @@ if args.count > 1 {
                 }
                 app.terminate(nil)
             case .failure(let error):
-                print("查询失败: \(error)")
+                if let apiError = error as? DictionaryQueryError {
+                    switch apiError {
+                    case .notFoundWithSuggestions(let input, let suggestions):
+                        print("未找到「\(input)」的释义，您是否想查：")
+                        for sug in suggestions {
+                            print("  - \(sug.word)  \(sug.trans)")
+                        }
+                    case .notFound(let input):
+                        print("未找到「\(input)」的释义，请检查拼写")
+                    case .network(let underlying):
+                        print("网络连接失败: \(underlying.localizedDescription)")
+                    case .invalidResponse:
+                        print("查询失败: 响应数据异常")
+                    }
+                } else {
+                    print("查询失败: \(error.localizedDescription)")
+                }
                 app.terminate(nil)
             }
         }

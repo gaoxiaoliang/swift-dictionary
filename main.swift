@@ -11,7 +11,7 @@ class Database {
     static let shared = Database()
     
     private var db: OpaquePointer?
-    private let dbPath = "/Users/clearbug/Desktop/my-swift-dictionary/dictionary.db"
+    private let dbPath = "/Users/clearbug/Desktop/swift-dictionary/dictionary.db"
     
     init() {
         Logger.shared.log("DB: 初始化数据库 - \(dbPath)")

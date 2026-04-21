@@ -315,12 +315,27 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
     var phoneticLabel: NSTextField!
     var playButton: NSButton!
     var definitionsTextView: NSTextView!
+    var scrollView: NSScrollView!
+    var scrollViewHeightConstraint: NSLayoutConstraint!
     var loadingIndicator: NSProgressIndicator!
     
     var currentAudioURL: URL?
     var audioPlayer: AVAudioPlayer?
     var hasSearched: Bool = false
     var lastInputLength: Int = 0
+    
+    // 布局常量
+    static let contentWidth: CGFloat = 500
+    static let horizontalPadding: CGFloat = 20
+    static let textViewWidth: CGFloat = contentWidth - horizontalPadding * 2  // 460
+    static let minDefinitionsHeight: CGFloat = 0
+    static let maxDefinitionsHeight: CGFloat = 500
+    
+    // 当释义区为空时的基础高度 (search + wordLabel 区域 + 各种边距)
+    // 布局: top(20) + searchField(28) + gap(20) + wordLabel(≈38) + gap(20) + scrollView + bottom(20)
+    static let baseHeightWithoutDefinitions: CGFloat = 20 + 28 + 20 + 38 + 20 + 20
+    // 初始(未查询)窗口高度: 只显示搜索框
+    static let initialHeight: CGFloat = 20 + 28 + 20
     
     override func loadView() {
         Logger.shared.log("View: loadView")
@@ -367,13 +382,15 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
         playButton.isHidden = true
         view.addSubview(playButton)
         
-        let scrollView = NSScrollView()
+        scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.hasVerticalScroller = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
         
-        definitionsTextView = NSTextView(frame: NSRect(x: 0, y: 0, width: 460, height: 300))
+        let textViewWidth = DictionaryViewController.textViewWidth
+        definitionsTextView = NSTextView(frame: NSRect(x: 0, y: 0, width: textViewWidth, height: 0))
         definitionsTextView.isEditable = false
         definitionsTextView.isSelectable = true
         definitionsTextView.font = NSFont.systemFont(ofSize: 14)
@@ -381,8 +398,10 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
         definitionsTextView.backgroundColor = .clear
         definitionsTextView.isVerticallyResizable = true
         definitionsTextView.isHorizontallyResizable = false
-        definitionsTextView.textContainer?.containerSize = NSSize(width: 460, height: CGFloat.greatestFiniteMagnitude)
+        definitionsTextView.textContainerInset = NSSize(width: 0, height: 0)
+        definitionsTextView.textContainer?.containerSize = NSSize(width: textViewWidth, height: CGFloat.greatestFiniteMagnitude)
         definitionsTextView.textContainer?.widthTracksTextView = true
+        definitionsTextView.textContainer?.lineFragmentPadding = 0
         scrollView.documentView = definitionsTextView
         view.addSubview(scrollView)
         
@@ -416,11 +435,13 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
             scrollView.topAnchor.constraint(equalTo: wordLabel.bottomAnchor, constant: 20),
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
-            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -20),
             
             loadingIndicator.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             loadingIndicator.centerYAnchor.constraint(equalTo: view.centerYAnchor),
         ])
+        
+        scrollViewHeightConstraint = scrollView.heightAnchor.constraint(equalToConstant: 0)
+        scrollViewHeightConstraint.isActive = true
     }
     
     @objc func searchWordAction() {
@@ -461,6 +482,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
         Logger.shared.log("View: 释义内容: \(data.definitions)")
         definitionsTextView.string = data.definitions.joined(separator: "\n")
         
+        // 根据释义内容自适应调整窗口高度
+        adjustWindowHeightForContent()
+        
         if let cachedData = data.cachedAudioData {
             Logger.shared.log("View: 使用缓存音频 \(cachedData.count) bytes")
             do {
@@ -475,6 +499,48 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
             Logger.shared.log("View: 准备播放发音")
             playAudioAction()
         }
+    }
+    
+    /// 根据当前释义内容计算所需高度，并动态调整 scrollView 高度及窗口高度
+    func adjustWindowHeightForContent() {
+        guard view.window != nil,
+              let layoutManager = definitionsTextView.layoutManager,
+              let textContainer = definitionsTextView.textContainer else { return }
+        
+        // 强制文本排版以获取真实高度
+        layoutManager.ensureLayout(for: textContainer)
+        let usedRect = layoutManager.usedRect(for: textContainer)
+        let contentHeight = ceil(usedRect.height)
+        
+        let clampedHeight = min(max(contentHeight, DictionaryViewController.minDefinitionsHeight),
+                                DictionaryViewController.maxDefinitionsHeight)
+        
+        scrollViewHeightConstraint.constant = clampedHeight
+        
+        // 计算窗口目标高度: baseHeightWithoutDefinitions 已包含 scrollView 上下各 20 的间距，
+        // 这里减去上下间距常量中已计入的尾部 20, 再按实际内容追加.
+        let bottomPadding: CGFloat = clampedHeight > 0 ? 20 : 0
+        let contentAreaHeight = DictionaryViewController.baseHeightWithoutDefinitions - 20 + clampedHeight + bottomPadding
+        
+        resizeWindowKeepingTop(to: contentAreaHeight)
+        
+        Logger.shared.log("View: 自适应高度 - 文本高度: \(contentHeight), scrollView: \(clampedHeight), 窗口内容区: \(contentAreaHeight)")
+    }
+    
+    /// 调整窗口高度，同时保持窗口顶部位置不变
+    func resizeWindowKeepingTop(to contentHeight: CGFloat) {
+        guard let window = view.window else { return }
+        
+        let currentFrame = window.frame
+        let currentContentSize = window.contentRect(forFrameRect: currentFrame).size
+        let heightDelta = contentHeight - currentContentSize.height
+        
+        var newFrame = currentFrame
+        newFrame.size.height = currentFrame.size.height + heightDelta
+        // 保持顶部 y 坐标不变 (macOS 坐标系原点在左下)
+        newFrame.origin.y = currentFrame.maxY - newFrame.size.height
+        
+        window.setFrame(newFrame, display: true, animate: false)
     }
     
     @objc func playAudioAction() {
@@ -517,6 +583,18 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
         phoneticLabel.isHidden = true
         playButton.isHidden = true
         definitionsTextView.string = message
+        adjustWindowHeightForContent()
+    }
+    
+    /// 清空显示内容, 将窗口恢复到初始 (仅搜索框) 高度
+    func resetToInitialState() {
+        hasSearched = false
+        wordLabel.isHidden = true
+        phoneticLabel.isHidden = true
+        playButton.isHidden = true
+        definitionsTextView.string = ""
+        scrollViewHeightConstraint.constant = 0
+        resizeWindowKeepingTop(to: DictionaryViewController.initialHeight)
     }
     
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -531,11 +609,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate {
         let currentLength = searchField.stringValue.count
         if hasSearched && currentLength > lastInputLength {
             let newChar = searchField.stringValue.suffix(1)
-            hasSearched = false
-            wordLabel.isHidden = true
-            phoneticLabel.isHidden = true
-            playButton.isHidden = true
-            definitionsTextView.string = ""
+            resetToInitialState()
             searchField.stringValue = String(newChar)
             lastInputLength = 1
         } else {
@@ -563,13 +637,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         registerGlobalHotKey()
         Logger.shared.log("App: 全局快捷键已注册 (Cmd+Shift+D)")
         
-        // 强制显示
-        window.setFrameAutosaveName("MainWindow")
-        window.center()
+        // 定位窗口到屏幕顶部 (菜单栏正下方)
+        positionWindowAtTop()
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
         Logger.shared.log("App: 窗口已显示 - isVisible: \(window.isVisible), frame: \(window.frame)")
+    }
+    
+    /// 将窗口水平居中并紧贴系统菜单栏下方
+    func positionWindowAtTop() {
+        guard let screen = NSScreen.main else { return }
+        // visibleFrame 排除了菜单栏和 Dock, 其 maxY 即为菜单栏下边缘的 y 坐标
+        let visibleFrame = screen.visibleFrame
+        let windowWidth = window.frame.width
+        let x = visibleFrame.origin.x + (visibleFrame.width - windowWidth) / 2
+        let topLeft = NSPoint(x: x, y: visibleFrame.maxY)
+        window.setFrameTopLeftPoint(topLeft)
     }
     
     func applicationWillTerminate(_ notification: Notification) {
@@ -592,19 +676,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func setupWindow() {
-        let screenHeight = NSScreen.main?.frame.height ?? 400
+        let initialHeight = DictionaryViewController.initialHeight
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
+            contentRect: NSRect(x: 0, y: 0, width: DictionaryViewController.contentWidth, height: initialHeight),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         window.title = "词典"
-        window.setFrameTopLeftPoint(NSPoint(x: (NSScreen.main?.frame.width ?? 500) / 2 - 250, y: screenHeight - 10))
         window.isReleasedWhenClosed = false
         window.level = .floating
         window.contentViewController = DictionaryViewController()
-        window.setFrameAutosaveName("MainWindow")
+        // 不使用 setFrameAutosaveName, 否则会恢复上次位置/大小, 破坏 "顶部固定 + 自适应高度" 行为
     }
     
     func registerGlobalHotKey() {
@@ -646,9 +729,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             window.orderOut(nil)
         } else {
             Logger.shared.log("App: 显示窗口 - frame: \(window.frame)")
-            window.setFrameAutosaveName("MainWindow")
-            let screenHeight = NSScreen.main?.frame.height ?? 400
-            window.setFrameTopLeftPoint(NSPoint(x: (NSScreen.main?.frame.width ?? 500) / 2 - 250, y: screenHeight - 10))
+            positionWindowAtTop()
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
             NSApp.activate(ignoringOtherApps: true)

@@ -365,7 +365,17 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     var currentAudioURL: URL?
     var audioPlayer: AVAudioPlayer?
     var hasSearched: Bool = false
-    var lastInputLength: Int = 0
+    /// 当前展示结果所对应的单词, 用于在 controlTextDidChange 中识别
+    /// "用户是否在已有结果末尾追加字符", 从而把追加字符视为新一次输入并覆盖原词.
+    var displayedWord: String = ""
+    
+    private var pasteMonitor: Any?
+    
+    /// 粘贴内容长度上限 (超过视为不合理, 不自动查询)
+    static let maxPasteLength: Int = 64
+    
+    // Cmd+V 的 key code
+    private static let keyCodeV: UInt16 = 9
     
     // 布局常量
     static let contentWidth: CGFloat = 500
@@ -493,6 +503,96 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         
         scrollViewHeightConstraint = scrollView.heightAnchor.constraint(equalToConstant: 0)
         scrollViewHeightConstraint.isActive = true
+        
+        installPasteMonitor()
+    }
+    
+    deinit {
+        if let monitor = pasteMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+    }
+    
+    /// 安装 Cmd+V 局部事件监听器: 搜索框获得焦点时, 读剪贴板 -> 清洗 -> 自动查询.
+    private func installPasteMonitor() {
+        pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self else { return event }
+            let isCmdV = event.modifierFlags.contains(.command)
+                && event.keyCode == DictionaryViewController.keyCodeV
+                && !event.modifierFlags.contains(.shift)
+                && !event.modifierFlags.contains(.option)
+                && !event.modifierFlags.contains(.control)
+            guard isCmdV else { return event }
+            
+            // 只在搜索框 (或其 field editor) 是第一响应者时接管 Cmd+V
+            guard let window = self.view.window,
+                  let responder = window.firstResponder else { return event }
+            
+            let searchFieldOwnsFocus: Bool = {
+                if responder === self.searchField { return true }
+                if let editor = self.searchField.currentEditor(), responder === editor { return true }
+                return false
+            }()
+            guard searchFieldOwnsFocus else { return event }
+            
+            if self.handlePasteAndSearch() {
+                return nil  // 吞掉事件, 防止系统默认粘贴再跑一遍
+            }
+            return event
+        }
+    }
+    
+    /// 从剪贴板读取内容, 清洗后填充搜索框并自动查询. 返回是否成功处理.
+    @discardableResult
+    private func handlePasteAndSearch() -> Bool {
+        guard let raw = NSPasteboard.general.string(forType: .string) else {
+            Logger.shared.log("View: Cmd+V 剪贴板为空或非文本")
+            return false
+        }
+        
+        guard let cleaned = Self.sanitizePastedWord(raw) else {
+            Logger.shared.log("View: Cmd+V 剪贴板内容不符合英文单词/短语规范, 忽略 (原文长度=\(raw.count))")
+            return false
+        }
+        
+        Logger.shared.log("View: Cmd+V 粘贴并查询 '\(cleaned)'")
+        // 先隐藏旧结果 (同时清 hasSearched / displayedWord),
+        // 避免随后的 stringValue 赋值触发 controlTextDidChange 的覆盖分支.
+        hideResultArea()
+        searchField.stringValue = cleaned
+        if let editor = searchField.currentEditor() {
+            editor.selectedRange = NSRange(location: cleaned.count, length: 0)
+        }
+        searchWordAction()
+        return true
+    }
+    
+    /// 清洗剪贴板内容: 去首尾空白 -> 取首行 -> 长度限制 -> 仅允许英文字母/空格/连字符/撇号.
+    /// 任一步失败返回 nil (交由系统默认粘贴行为处理, 不自动触发查询).
+    static func sanitizePastedWord(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        
+        // 取首行 (剪贴板里若带多行, 只用第一行)
+        let firstLine = trimmed
+            .split(whereSeparator: { $0.isNewline })
+            .first
+            .map(String.init) ?? trimmed
+        let line = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty, line.count <= maxPasteLength else { return nil }
+        
+        // 只接受英文字母/空格/连字符/撇号 (覆盖 "don't", "self-made", "New York" 等常见短语/词形)
+        let allowed = CharacterSet.letters
+            .union(.whitespaces)
+            .union(CharacterSet(charactersIn: "-'’"))
+        if line.unicodeScalars.contains(where: { !allowed.contains($0) }) {
+            return nil
+        }
+        // 至少含一个字母
+        guard line.unicodeScalars.contains(where: { CharacterSet.letters.contains($0) }) else {
+            return nil
+        }
+        return line
     }
     
     @objc func searchWordAction() {
@@ -500,6 +600,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         guard !word.isEmpty else { return }
         
         Logger.shared.log("View: 查询单词 '\(word)'")
+        // 记录本次查询实际提交到输入框里的原始字符串, 供 controlTextDidChange 识别
+        // "用户是否在已有结果后继续键入" 以便触发覆盖逻辑.
+        displayedWord = searchField.stringValue
         showLoading(true)
         
         YoudaoAPI.shared.query(word: word) { [weak self] result in
@@ -750,20 +853,8 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         
         Logger.shared.log("View: 点击拼写建议 '\(word)'")
         searchField.stringValue = word
-        lastInputLength = word.count
         searchWordAction()
         return true
-    }
-    
-    /// 清空显示内容, 将窗口恢复到初始 (仅搜索框) 高度
-    func resetToInitialState() {
-        hasSearched = false
-        wordLabel.isHidden = true
-        phoneticLabel.isHidden = true
-        playButton.isHidden = true
-        definitionsTextView.string = ""
-        scrollViewHeightConstraint.constant = 0
-        resizeWindowKeepingTop(to: DictionaryViewController.initialHeight)
     }
     
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -775,15 +866,38 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     }
     
     func controlTextDidChange(_ notification: Notification) {
-        let currentLength = searchField.stringValue.count
-        if hasSearched && currentLength > lastInputLength {
-            let newChar = searchField.stringValue.suffix(1)
-            resetToInitialState()
-            searchField.stringValue = String(newChar)
-            lastInputLength = 1
-        } else {
-            lastInputLength = currentLength
+        guard hasSearched else { return }
+        
+        let current = searchField.stringValue
+        
+        // 识别 "用户在已有结果末尾继续键入" 的场景:
+        // 当前字段内容 == 已查询的单词 + 追加部分. 此时视为新一次输入, 把原词覆盖为追加部分.
+        // 其他变更 (删除/选中替换/中间编辑等) 只隐藏结果区, 不改动输入框内容.
+        if !displayedWord.isEmpty,
+           current.count > displayedWord.count,
+           current.hasPrefix(displayedWord) {
+            let appended = String(current.dropFirst(displayedWord.count))
+            Logger.shared.log("View: 已有结果后键入新字符, 覆盖原词 '\(displayedWord)' -> '\(appended)'")
+            searchField.stringValue = appended
+            if let editor = searchField.currentEditor() {
+                let end = appended.count
+                editor.selectedRange = NSRange(location: end, length: 0)
+            }
         }
+        
+        hideResultArea()
+    }
+    
+    /// 隐藏结果展示区 (不触碰 searchField 内容), 并把窗口收回到仅搜索框的高度.
+    func hideResultArea() {
+        hasSearched = false
+        displayedWord = ""
+        wordLabel.isHidden = true
+        phoneticLabel.isHidden = true
+        playButton.isHidden = true
+        definitionsTextView.string = ""
+        scrollViewHeightConstraint.constant = 0
+        resizeWindowKeepingTop(to: DictionaryViewController.initialHeight)
     }
 }
 

@@ -5,15 +5,52 @@ import AVFoundation
 import Carbon
 import SQLite3
 
+// MARK: - App Paths
+
+/// 应用用户态存储目录 (遵循 macOS 惯例).
+/// - 数据库: ~/Library/Application Support/swift-dict/dictionary.db
+/// - 日志:   ~/Library/Logs/swift-dict/
+enum AppPaths {
+    static let appSupportDir: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return base.appendingPathComponent("swift-dict", isDirectory: true)
+    }()
+
+    static let logsDir: URL = {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/swift-dict", isDirectory: true)
+    }()
+
+    static let databaseURL: URL = appSupportDir.appendingPathComponent("dictionary.db")
+
+    static func ensureDirectoriesExist() {
+        try? FileManager.default.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+    }
+}
+
+// MARK: - App Info (static metadata)
+
+/// 静态开发者/应用信息, 供 "关于" 面板和窗口标题使用.
+enum AppInfo {
+    static let displayName = "词典"
+    static let developerName = "Xiaoliang Gao"
+    static let developerEmail = "xiaoliang.gao.dev@gmail.com"
+    static let githubURL = "https://github.com/gaoxiaoliang/swift-dictionary"
+}
+
+// Note: BuildInfo (commit / buildTime / version) is generated at compile time
+// by the Makefile from BuildInfo.swift.in. See BuildInfo.swift.
+
 // MARK: - Database
 
 class Database {
     static let shared = Database()
     
     private var db: OpaquePointer?
-    private let dbPath = "/Users/clearbug/Desktop/swift-dictionary/dictionary.db"
     
     init() {
+        let dbPath = AppPaths.databaseURL.path
         Logger.shared.log("DB: 初始化数据库 - \(dbPath)")
         if sqlite3_open(dbPath, &db) != SQLITE_OK {
             Logger.shared.error("DB: 无法打开数据库", error: nil)
@@ -132,46 +169,80 @@ class Database {
 
 // MARK: - Logger
 
-class Logger {
+/// 开发模式 (DEBUG 构建): 日志同时写入 stdout 和文件;
+/// 生产模式 (RELEASE 构建): 日志仅写入 ~/Library/Logs/swift-dict/ 下的文件.
+/// 每次启动时清理超过 "昨日" 的旧日志文件 (保留今日 + 昨日两份).
+final class Logger {
     static let shared = Logger()
-    
-    let logFile: URL?
-    
-    init() {
-        // macOS 标准日志位置: ~/Library/Logs/swift-dict/
-        let logsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/swift-dict")
-        
-        // 创建日志目录
-        try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
-        
+
+    private let logFile: URL?
+    private let queue = DispatchQueue(label: "com.xiaoliang.swift-dict.logger")
+    private let timestampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
+
+    #if DEBUG
+    static let isDebugBuild = true
+    #else
+    static let isDebugBuild = false
+    #endif
+
+    private init() {
+        AppPaths.ensureDirectoriesExist()
+
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd"
         let dateStr = dateFormatter.string(from: Date())
-        
-        logFile = logsDir.appendingPathComponent("swift-dict-\(dateStr).log")
-        
-        log("=== 应用启动 ===")
+        logFile = AppPaths.logsDir.appendingPathComponent("swift-dict-\(dateStr).log")
+
+        pruneOldLogs()
+
+        log("=== 应用启动 === (mode: \(Logger.isDebugBuild ? "DEBUG" : "RELEASE"))")
     }
-    
+
+    /// 保留今日 + 昨日的日志文件, 删除更旧的 (基于 mtime 判断).
+    private func pruneOldLogs() {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: AppPaths.logsDir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        // 今天 0 点往前推 24 小时 = 昨天 0 点, 即昨天 0 点之前的文件删除
+        let cutoff = Calendar.current.startOfDay(for: Date()).addingTimeInterval(-24 * 60 * 60)
+
+        for file in files where file.pathExtension == "log" {
+            if let attrs = try? fm.attributesOfItem(atPath: file.path),
+               let mtime = attrs[.modificationDate] as? Date,
+               mtime < cutoff {
+                try? fm.removeItem(at: file)
+            }
+        }
+    }
+
     func log(_ message: String) {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        let timestamp = dateFormatter.string(from: Date())
-        
-        let logLine = "[\(timestamp)] \(message)"
-        
-        // 输出到标准输出
-        print(logLine)
-        
-        // 写入文件
-        if let logFile = logFile {
-            let line = logLine + "\n"
-            if let data = line.data(using: .utf8) {
+        let timestamp = timestampFormatter.string(from: Date())
+        let line = "[\(timestamp)] \(message)"
+
+        queue.async { [weak self] in
+            guard let self = self else { return }
+
+            // 开发模式: 同时输出到 stdout
+            if Logger.isDebugBuild {
+                print(line)
+            }
+
+            // 两种模式都写文件
+            if let logFile = self.logFile,
+               let data = (line + "\n").data(using: .utf8) {
                 if FileManager.default.fileExists(atPath: logFile.path) {
-                    if let fileHandle = try? FileHandle(forWritingTo: logFile) {
-                        fileHandle.seekToEndOfFile()
-                        fileHandle.write(data)
-                        fileHandle.closeFile()
+                    if let handle = try? FileHandle(forWritingTo: logFile) {
+                        handle.seekToEndOfFile()
+                        handle.write(data)
+                        try? handle.close()
                     }
                 } else {
                     try? data.write(to: logFile)
@@ -179,10 +250,10 @@ class Logger {
             }
         }
     }
-    
+
     func error(_ message: String, error: Error? = nil) {
-        let errorMsg = error != nil ? " - \(error!.localizedDescription)" : ""
-        log("❌ \(message)\(errorMsg)")
+        let suffix = error != nil ? " - \(error!.localizedDescription)" : ""
+        log("❌ \(message)\(suffix)")
     }
 }
 
@@ -1079,14 +1150,78 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "book.fill", accessibilityDescription: "Dictionary")
             button.target = self
-            button.action = #selector(statusItemClicked)
-            Logger.shared.log("App: 状态栏按钮点击事件已绑定")
+            button.action = #selector(statusItemClicked(_:))
+            // 同时接收左键和右键的抬起事件, 由 action 中根据事件类型分流
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            Logger.shared.log("App: 状态栏按钮点击事件已绑定 (左键/右键)")
         }
     }
     
-    @objc func statusItemClicked() {
-        Logger.shared.log("App: 点击状态栏图标")
-        toggleWindow()
+    @objc func statusItemClicked(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        if event?.type == .rightMouseUp {
+            Logger.shared.log("App: 右键点击状态栏图标 - 弹出菜单")
+            showStatusItemMenu()
+        } else {
+            Logger.shared.log("App: 左键点击状态栏图标 - 切换窗口")
+            toggleWindow()
+        }
+    }
+    
+    /// 右键菜单: 关于 / 退出. 动态挂载到 statusItem.menu, 弹出后立即摘除
+    /// 以免左键点击也出现菜单.
+    private func showStatusItemMenu() {
+        let menu = NSMenu()
+
+        let aboutItem = NSMenuItem(
+            title: "关于 \(AppInfo.displayName)",
+            action: #selector(showAboutPanel),
+            keyEquivalent: ""
+        )
+        aboutItem.target = self
+        menu.addItem(aboutItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let quitItem = NSMenuItem(
+            title: "退出 \(AppInfo.displayName)",
+            action: #selector(quitApp),
+            keyEquivalent: "q"
+        )
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    @objc func quitApp() {
+        Logger.shared.log("App: 用户通过菜单退出应用")
+        NSApp.terminate(nil)
+    }
+
+    /// "关于" 面板: 展示开发者信息 + 构建元数据.
+    /// accessory app 不会自动聚焦, 弹框前先 activate 避免 Alert 被遮挡.
+    @objc func showAboutPanel() {
+        Logger.shared.log("App: 显示关于面板")
+
+        let alert = NSAlert()
+        alert.messageText = AppInfo.displayName
+        alert.informativeText = """
+        开发者: \(AppInfo.developerName)
+        邮箱: \(AppInfo.developerEmail)
+        GitHub: \(AppInfo.githubURL)
+
+        Commit: \(BuildInfo.commit)
+        构建时间: \(BuildInfo.buildTime)
+        构建模式: \(Logger.isDebugBuild ? "DEBUG" : "RELEASE")
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "好的")
+
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
     
     func setupWindow() {
@@ -1097,7 +1232,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "词典"
+        window.title = AppInfo.displayName
         window.isReleasedWhenClosed = false
         window.level = .floating
         window.contentViewController = DictionaryViewController()
@@ -1147,35 +1282,9 @@ app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
 
-let mainMenu = NSMenu()
-let appMenuItem = NSMenuItem()
-let appMenu = NSMenu()
-appMenu.addItem(withTitle: "关于 swift-dict", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
-appMenu.addItem(NSMenuItem.separator())
-appMenu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-appMenuItem.submenu = appMenu
-mainMenu.addItem(appMenuItem)
-
-let editMenuItem = NSMenuItem()
-let editMenu = NSMenu(title: "编辑")
-editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
-editMenu.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
-editMenu.addItem(NSMenuItem.separator())
-editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-editMenuItem.submenu = editMenu
-mainMenu.addItem(editMenuItem)
-
-let windowMenuItem = NSMenuItem()
-let windowMenu = NSMenu(title: "窗口")
-windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.miniaturize(_:)), keyEquivalent: "m")
-windowMenu.addItem(withTitle: "关闭", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-windowMenuItem.submenu = windowMenu
-mainMenu.addItem(windowMenuItem)
-
-app.mainMenu = mainMenu
+// Note: accessory app 不会在系统菜单栏渲染 app.mainMenu, 因此这里不构建主菜单.
+// 状态栏右键菜单 (关于/退出) 由 AppDelegate.showStatusItemMenu() 动态生成.
+// 文本框内的 Cmd+X/C/V/A 依然通过 NSText 默认响应链工作, 无需 mainMenu.
 
 // 命令行参数支持
 let args = CommandLine.arguments

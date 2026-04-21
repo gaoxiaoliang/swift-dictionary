@@ -1,1 +1,19 @@
+# Built binary
 swift-dict
+
+# Build outputs
+build/
+dist/
+*.dmg
+
+# Generated build info (regenerated on every build)
+BuildInfo.swift
+
+# Local dev database (moved to ~/Library/Application Support/swift-dict/)
+dictionary.db
+
+# Swift debug symbols
+*.dSYM/
+
+# macOS
+.DS_Store

@@ -42,6 +42,33 @@ enum AppInfo {
 // Note: BuildInfo (commit / buildTime / version) is generated at compile time
 // by the Makefile from BuildInfo.swift.in. See BuildInfo.swift.
 
+// MARK: - App Configuration
+
+/// 应用配置, 使用 UserDefaults 持久化. 增删配置项时在 register(defaults:) 中补充默认值.
+class AppConfig {
+    static let shared = AppConfig()
+
+    private let defaults = UserDefaults.standard
+
+    private enum Keys {
+        static let fadeOutEnabled = "fadeOutEnabled"
+    }
+
+    init() {
+        defaults.register(defaults: [
+            Keys.fadeOutEnabled: true
+        ])
+    }
+
+    var fadeOutEnabled: Bool {
+        get { defaults.bool(forKey: Keys.fadeOutEnabled) }
+        set {
+            defaults.set(newValue, forKey: Keys.fadeOutEnabled)
+            Logger.shared.log("Config: fadeOutEnabled -> \(newValue)")
+        }
+    }
+}
+
 // MARK: - Database
 
 class Database {
@@ -791,6 +818,10 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     
     /// (重新) 启动淡出: alpha 1.0 -> 0.0 over `fadeOutTotalDuration`, 末尾 orderOut
     func startFadeOutCountdown() {
+        guard AppConfig.shared.fadeOutEnabled else {
+            Logger.shared.log("View: 淡出已禁用, 跳过")
+            return
+        }
         cancelFadeOut()
         guard let window = view.window, window.isVisible else { return }
         
@@ -1238,7 +1269,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    /// 右键菜单: 关于 / 退出. 动态挂载到 statusItem.menu, 弹出后立即摘除
+    /// 右键菜单: 关于 / 配置 / 退出. 动态挂载到 statusItem.menu, 弹出后立即摘除
     /// 以免左键点击也出现菜单.
     private func showStatusItemMenu() {
         let menu = NSMenu()
@@ -1250,6 +1281,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         aboutItem.target = self
         menu.addItem(aboutItem)
+
+        let configItem = NSMenuItem(
+            title: "配置...",
+            action: #selector(showConfigPanel),
+            keyEquivalent: ","
+        )
+        configItem.target = self
+        menu.addItem(configItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -1292,6 +1331,51 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
+    }
+
+    /// "配置" 面板: 让用户选择是否启用查询完成后的自动淡出.
+    @objc func showConfigPanel() {
+        if let vc = window.contentViewController as? DictionaryViewController {
+            vc.cancelFadeOut()
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "配置"
+        alert.alertStyle = .informational
+
+        let checkbox = NSButton(checkboxWithTitle: "查询完成后自动淡出窗口", target: nil, action: nil)
+        checkbox.state = AppConfig.shared.fadeOutEnabled ? .on : .off
+
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.addArrangedSubview(checkbox)
+        container.setFrameSize(NSSize(width: 240, height: 24))
+
+        alert.accessoryView = container
+
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+
+        if response == .alertFirstButtonReturn {
+            let newEnabled = (checkbox.state == .on)
+            let oldEnabled = AppConfig.shared.fadeOutEnabled
+            AppConfig.shared.fadeOutEnabled = newEnabled
+
+            if !newEnabled {
+                if let vc = window.contentViewController as? DictionaryViewController {
+                    vc.cancelFadeOut()
+                }
+            } else if newEnabled && !oldEnabled {
+                if let vc = window.contentViewController as? DictionaryViewController {
+                    if vc.hasSearched {
+                        vc.startFadeOutCountdown()
+                    }
+                }
+            }
+        }
     }
     
     func setupWindow() {

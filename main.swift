@@ -1139,13 +1139,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var statusItem: NSStatusItem!
     
-    // 双击 Right Command 检测
-    private var rightCmdLastPressAt: TimeInterval = 0
-    private var rightCmdWasDown: Bool = false
+    // 单击 Right Command 检测
+    /// Right Cmd 按下后标记为待触发; 若释放前按了任何其他键, 则取消 (说明是组合快捷键)
+    private var rightCmdTriggerPending = false
+    /// 跟踪 Right Cmd 按下/释放状态, 用 toggle() 切换以避免左右 Cmd 同时按下时判断错误
+    private var rightCmdIsDown = false
     private var globalFlagsMonitor: Any?
     private var localFlagsMonitor: Any?
-    /// 双击判定的最大时间间隔 (秒)
-    private static let doubleTapWindow: TimeInterval = 0.35
+    private var globalKeyDownMonitor: Any?
+    private var localKeyDownMonitor: Any?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         Logger.shared.log("App: applicationDidFinishLaunching")
@@ -1163,7 +1165,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Logger.shared.log("App: 窗口已设置 - frame: \(window.frame)")
         
         checkAccessibilityPermission()
-        installRightCommandDoubleTapMonitor()
+        installRightCommandMonitor()
         
         // 定位窗口到屏幕顶部 (菜单栏正下方)
         positionWindowAtTop()
@@ -1181,51 +1183,68 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if trusted {
             Logger.shared.log("App: 辅助功能权限已授予")
         } else {
-            Logger.shared.log("⚠️ App: 辅助功能权限未授予, 双击 Right Command 全局快捷键无法工作.")
+            Logger.shared.log("⚠️ App: 辅助功能权限未授予, Right Command 快捷键无法工作.")
             Logger.shared.log("⚠️ App: 请在 系统偏好设置 → 安全性与隐私 → 隐私 → 辅助功能 中勾选 swift-dict, 然后重启应用.")
         }
     }
     
-    /// 安装全局 + 本地 flagsChanged 监听, 实现 "双击 Right Command 唤起/隐藏"
-    func installRightCommandDoubleTapMonitor() {
+    /// 安装全局 + 本地事件监听, 实现 "单击 Right Command 唤起/隐藏".
+    /// 同时监听 flagsChanged (修饰键变化) 和 keyDown (普通按键), 以区分:
+    /// - 单独按下并释放 Right Cmd → 切换窗口
+    /// - Right Cmd + 其他键 (组合快捷键) → 不触发, 避免误触
+    func installRightCommandMonitor() {
         globalFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             self?.processFlagsChanged(event)
         }
-        // local monitor 让窗口自身处于前台时也能响应 (全局监听不触发自家应用的事件)
         localFlagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             self?.processFlagsChanged(event)
             return event
         }
-        Logger.shared.log("App: 双击 Right Command 监听已安装")
+
+        globalKeyDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.processKeyDown()
+        }
+        localKeyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.processKeyDown()
+            return event
+        }
+        Logger.shared.log("App: Right Command 监听已安装 (单击模式, 组合键不触发)")
     }
     
     /// HID key code: 左 Command = 55, 右 Command = 54
     private static let rightCommandKeyCode: UInt16 = 54
     
     private func processFlagsChanged(_ event: NSEvent) {
-        // flagsChanged 事件的 keyCode 表示 "刚刚发生变化的那个修饰键". 仅关心右 Cmd.
+        // 若 Right Cmd 待触发期间有其他修饰键变化, 说明用户在按组合键, 取消触发
+        if rightCmdTriggerPending && event.keyCode != AppDelegate.rightCommandKeyCode {
+            rightCmdTriggerPending = false
+            return
+        }
+
         guard event.keyCode == AppDelegate.rightCommandKeyCode else { return }
-        
-        // 对右 Cmd 来说: 按下事件 modifierFlags 含 .command, 释放事件不含.
-        // (用户同时按下左右 Cmd 的极端场景不做处理, 不影响常规双击识别)
-        let isDown = event.modifierFlags.contains(.command)
-        
-        // 只在 "从释放 -> 按下" 的瞬间做判定
-        if isDown && !rightCmdWasDown {
-            rightCmdWasDown = true
-            let now = Date().timeIntervalSince1970
-            let delta = now - rightCmdLastPressAt
-            if delta <= AppDelegate.doubleTapWindow {
-                rightCmdLastPressAt = 0  // 清零, 避免三连击误判
-                Logger.shared.log("App: 检测到双击 Right Command (Δ=\(String(format: "%.3f", delta))s)")
+
+        // 用 toggle 跟踪按下/释放状态, 避免左右 Cmd 同时按下时 .command 标志位误判
+        rightCmdIsDown.toggle()
+
+        if rightCmdIsDown {
+            // 按下 Right Cmd → 标记待触发
+            rightCmdTriggerPending = true
+        } else {
+            // 释放 Right Cmd → 若仍待触发 (没有其他键被按下), 则切换窗口
+            if rightCmdTriggerPending {
+                rightCmdTriggerPending = false
+                Logger.shared.log("App: 检测到单击 Right Command")
                 DispatchQueue.main.async { [weak self] in
                     self?.toggleWindow()
                 }
-            } else {
-                rightCmdLastPressAt = now
             }
-        } else if !isDown {
-            rightCmdWasDown = false
+        }
+    }
+
+    /// 任何普通按键按下时, 若 Right Cmd 处于待触发状态, 说明用户在使用组合快捷键, 取消触发
+    private func processKeyDown() {
+        if rightCmdTriggerPending {
+            rightCmdTriggerPending = false
         }
     }
     
@@ -1244,6 +1263,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Logger.shared.log("App: 应用退出")
         if let m = globalFlagsMonitor { NSEvent.removeMonitor(m) }
         if let m = localFlagsMonitor { NSEvent.removeMonitor(m) }
+        if let m = globalKeyDownMonitor { NSEvent.removeMonitor(m) }
+        if let m = localKeyDownMonitor { NSEvent.removeMonitor(m) }
     }
     
     func setupStatusItem() {

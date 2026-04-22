@@ -31,6 +31,39 @@ enum AppPaths {
         try? FileManager.default.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
     }
+
+    /// 数据库文件大小 (字节), 文件不存在返回 nil
+    static var databaseFileSize: Int64? {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: databaseURL.path)
+        return attrs?[.size] as? Int64
+    }
+
+    /// 日志文件列表, 按修改时间逆序 (最新在前), 每项为 (URL, 大小字节)
+    static var logFiles: [(url: URL, size: Int64)] {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: logsDir,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        let filtered = files.filter { $0.pathExtension == "log" }
+        let sorted = filtered.sorted { a, b in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            return da > db
+        }
+        return sorted.compactMap { url in
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            return (url: url, size: Int64(size))
+        }
+    }
+
+    /// 将字节数格式化为人类可读字符串 (如 "1.2 MB")
+    static func formatFileSize(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
 }
 
 // MARK: - App Info (static metadata)
@@ -1348,7 +1381,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
 
         let aboutItem = NSMenuItem(
-            title: "关于 \(AppInfo.displayName)",
+            title: "关于",
             action: #selector(showAboutPanel),
             keyEquivalent: ""
         )
@@ -1356,7 +1389,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(aboutItem)
 
         let configItem = NSMenuItem(
-            title: "配置...",
+            title: "配置",
             action: #selector(showConfigPanel),
             keyEquivalent: ","
         )
@@ -1366,7 +1399,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
 
         let quitItem = NSMenuItem(
-            title: "退出 \(AppInfo.displayName)",
+            title: "退出",
             action: #selector(quitApp),
             keyEquivalent: "q"
         )
@@ -1406,49 +1439,171 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
-    /// "配置" 面板: 让用户选择是否启用查询完成后的自动淡出.
+    /// "配置" 面板: 单页分区平铺, 包含基本配置 / 数据库信息 / 日志信息.
     @objc func showConfigPanel() {
         if let vc = window.contentViewController as? DictionaryViewController {
             vc.cancelFadeOut()
         }
 
-        let alert = NSAlert()
-        alert.messageText = "配置"
-        alert.alertStyle = .informational
+        let panelWidth: CGFloat = 460
+        let horizontalPadding: CGFloat = 20
+        let verticalPadding: CGFloat = 16
 
-        let checkbox = NSButton(checkboxWithTitle: "查询完成后自动淡出窗口", target: nil, action: nil)
-        checkbox.state = AppConfig.shared.fadeOutEnabled ? .on : .off
+        let dbSize = AppPaths.databaseFileSize ?? 0
+        let logFileList = AppPaths.logFiles
 
-        let container = NSStackView()
-        container.orientation = .vertical
-        container.addArrangedSubview(checkbox)
-        container.setFrameSize(NSSize(width: 240, height: 24))
+        // --- 基本配置 ---
+        let fadeCheckbox = NSButton(checkboxWithTitle: "查询完成后自动淡出窗口", target: nil, action: nil)
+        fadeCheckbox.state = AppConfig.shared.fadeOutEnabled ? .on : .off
 
-        alert.accessoryView = container
+        // --- 数据库配置 ---
+        let dbSectionLabel = NSTextField(labelWithString: "数据库")
+        dbSectionLabel.font = NSFont.boldSystemFont(ofSize: 13)
 
-        alert.addButton(withTitle: "确定")
-        alert.addButton(withTitle: "取消")
+        let dbPathAndSize = NSTextField(string: "\(AppPaths.databaseURL.path)  (\(AppPaths.formatFileSize(dbSize)))")
+        dbPathAndSize.isEditable = false
+        dbPathAndSize.drawsBackground = true
+        dbPathAndSize.backgroundColor = NSColor.controlBackgroundColor
+        dbPathAndSize.textColor = NSColor.disabledControlTextColor
+        dbPathAndSize.font = NSFont.systemFont(ofSize: 11)
+        dbPathAndSize.lineBreakMode = .byTruncatingMiddle
+
+        // --- 日志配置 ---
+        let logSectionLabel = NSTextField(labelWithString: "日志")
+        logSectionLabel.font = NSFont.boldSystemFont(ofSize: 13)
+
+        let logStack = NSStackView()
+        logStack.orientation = .vertical
+        logStack.spacing = 3
+        logStack.alignment = .leading
+        logStack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+
+        if logFileList.isEmpty {
+            let emptyLabel = NSTextField(labelWithString: "无日志文件")
+            emptyLabel.font = NSFont.systemFont(ofSize: 11)
+            emptyLabel.textColor = NSColor.tertiaryLabelColor
+            logStack.addArrangedSubview(emptyLabel)
+        } else {
+            for entry in logFileList {
+                let row = NSStackView()
+                row.orientation = .horizontal
+                row.spacing = 8
+                row.alignment = .centerY
+
+                let pathField = NSTextField(string: entry.url.path)
+                pathField.isEditable = false
+                pathField.drawsBackground = true
+                pathField.backgroundColor = NSColor.controlBackgroundColor
+                pathField.textColor = NSColor.disabledControlTextColor
+                pathField.font = NSFont.systemFont(ofSize: 11)
+                pathField.lineBreakMode = .byTruncatingMiddle
+
+                let sizeLabel = NSTextField(labelWithString: AppPaths.formatFileSize(entry.size))
+                sizeLabel.font = NSFont.systemFont(ofSize: 11)
+                sizeLabel.textColor = NSColor.secondaryLabelColor
+
+                row.addArrangedSubview(pathField)
+                row.addArrangedSubview(sizeLabel)
+
+                pathField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+                sizeLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+                logStack.addArrangedSubview(row)
+            }
+        }
+
+        // --- 组装 ---
+        let contentStack = NSStackView()
+        contentStack.orientation = .vertical
+        contentStack.spacing = 6
+        contentStack.alignment = .leading
+        contentStack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+
+        // 基本配置区
+        let basicLabel = NSTextField(labelWithString: "基本配置")
+        basicLabel.font = NSFont.boldSystemFont(ofSize: 13)
+        contentStack.addArrangedSubview(basicLabel)
+        contentStack.addArrangedSubview(fadeCheckbox)
+
+        contentStack.addArrangedSubview(makeSeparator(width: panelWidth - horizontalPadding * 2))
+
+        // 数据库配置区
+        contentStack.addArrangedSubview(dbSectionLabel)
+        contentStack.addArrangedSubview(dbPathAndSize)
+
+        contentStack.addArrangedSubview(makeSeparator(width: panelWidth - horizontalPadding * 2))
+
+        // 日志配置区
+        contentStack.addArrangedSubview(logSectionLabel)
+        contentStack.addArrangedSubview(logStack)
+
+        // 设置宽度约束让子视图撑满
+        contentStack.setFrameSize(NSSize(width: panelWidth - horizontalPadding * 2, height: 0))
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 100),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "配置"
+        panel.isReleasedWhenClosed = false
+        panel.contentView = contentStack
+        panel.initialFirstResponder = fadeCheckbox
+
+        // 计算窗口高度: 内容高度 + padding*2
+        contentStack.layoutSubtreeIfNeeded()
+        let contentHeight = contentStack.fittingSize.height + verticalPadding * 2
+        panel.setContentSize(NSSize(width: panelWidth, height: contentHeight))
+
+        // 居中并添加内边距
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            contentStack.topAnchor.constraint(equalTo: panel.contentView!.topAnchor, constant: verticalPadding),
+            contentStack.leadingAnchor.constraint(equalTo: panel.contentView!.leadingAnchor, constant: horizontalPadding),
+            contentStack.trailingAnchor.constraint(equalTo: panel.contentView!.trailingAnchor, constant: -horizontalPadding),
+            contentStack.bottomAnchor.constraint(lessThanOrEqualTo: panel.contentView!.bottomAnchor, constant: -verticalPadding),
+        ])
 
         NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
 
-        if response == .alertFirstButtonReturn {
-            let newEnabled = (checkbox.state == .on)
+        panel.standardWindowButton(.closeButton)?.target = panel
+        panel.standardWindowButton(.closeButton)?.action = #selector(NSPanel.close)
+
+        // 监听窗口关闭通知以保存配置
+        _ = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            let newEnabled = (fadeCheckbox.state == .on)
             let oldEnabled = AppConfig.shared.fadeOutEnabled
             AppConfig.shared.fadeOutEnabled = newEnabled
 
             if !newEnabled {
-                if let vc = window.contentViewController as? DictionaryViewController {
+                if let vc = self.window.contentViewController as? DictionaryViewController {
                     vc.cancelFadeOut()
                 }
             } else if newEnabled && !oldEnabled {
-                if let vc = window.contentViewController as? DictionaryViewController {
+                if let vc = self.window.contentViewController as? DictionaryViewController {
                     if vc.hasSearched {
                         vc.startFadeOutCountdown()
                     }
                 }
             }
+            NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: panel)
         }
+    }
+
+    private func makeSeparator(width: CGFloat) -> NSView {
+        let sep = NSBox()
+        sep.boxType = .separator
+        sep.translatesAutoresizingMaskIntoConstraints = false
+        sep.widthAnchor.constraint(equalToConstant: width).isActive = true
+        return sep
     }
     
     func setupWindow() {

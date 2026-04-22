@@ -192,6 +192,20 @@ class Database {
         return nil
     }
     
+    /// 返回 words 表中的记录数; 查询失败返回 0
+    func wordCount() -> Int {
+        let sql = "SELECT COUNT(*) FROM words"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return 0
+        }
+        defer { sqlite3_finalize(stmt) }
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            return Int(sqlite3_column_int64(stmt, 0))
+        }
+        return 0
+    }
+
     func saveWord(_ word: String, phonetic: String?, audioData: Data?, definitions: [String]) {
         let insertSQL = """
             INSERT OR REPLACE INTO words (word, phonetics_uk, audio_data_uk, definitions, created_at, updated_at)
@@ -1118,6 +1132,28 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     }
 }
 
+// MARK: - Modal Panel
+
+/// 支持 Esc 关闭的 NSPanel 子类. 搭配 NSApp.runModal(for:) 使用时,
+/// Esc 会调用 cancelOperation(_:) -> 我们转发到 close(), 从而退出 modal loop.
+final class EscClosablePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+
+    override func cancelOperation(_ sender: Any?) {
+        close()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // 额外兜底: 某些情况下 cancelOperation 未被触发时, 直接检查 Esc keyCode (53)
+        if event.keyCode == 53 {
+            close()
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
 // MARK: - Main Menu
 
 /// 构造最小可用的 mainMenu. accessory app (LSUIElement) 的 mainMenu 不会在
@@ -1417,13 +1453,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// "关于" 面板: 展示开发者信息 + 构建元数据.
-    /// accessory app 不会自动聚焦, 弹框前先 activate 避免 Alert 被遮挡.
+    /// 使用 app-modal 形式展示, 支持 Esc 关闭, 不阻塞切换到其他应用.
     @objc func showAboutPanel() {
         Logger.shared.log("App: 显示关于面板")
 
-        let alert = NSAlert()
-        alert.messageText = AppInfo.displayName
-        alert.informativeText = """
+        let panelWidth: CGFloat = 420
+        let horizontalPadding: CGFloat = 24
+        let topPadding: CGFloat = 20
+        let bottomPadding: CGFloat = 20
+
+        let titleLabel = NSTextField(labelWithString: AppInfo.displayName)
+        titleLabel.font = NSFont.boldSystemFont(ofSize: 17)
+        titleLabel.textColor = .labelColor
+
+        let infoText = """
         开发者: \(AppInfo.developerName)
         邮箱: \(AppInfo.developerEmail)
         GitHub: \(AppInfo.githubURL)
@@ -1432,51 +1475,122 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         构建时间: \(BuildInfo.buildTime)
         构建模式: \(Logger.isDebugBuild ? "DEBUG" : "RELEASE")
         """
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "好的")
+        let infoLabel = NSTextField(wrappingLabelWithString: infoText)
+        infoLabel.font = NSFont.systemFont(ofSize: 12)
+        infoLabel.textColor = .labelColor
+        infoLabel.isSelectable = true
 
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
+        let okButton = NSButton(title: "好的", target: nil, action: nil)
+        okButton.bezelStyle = .rounded
+        okButton.keyEquivalent = "\r"  // 回车键等价于点击
+
+        let contentStack = NSStackView(views: [titleLabel, infoLabel])
+        contentStack.orientation = .vertical
+        contentStack.spacing = 12
+        contentStack.alignment = .leading
+
+        let buttonStack = NSStackView(views: [NSView(), okButton])
+        buttonStack.orientation = .horizontal
+        buttonStack.distribution = .fill
+        buttonStack.alignment = .centerY
+        // 让占位 view 吸收左侧空间, 按钮靠右
+        buttonStack.views.first?.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        okButton.setContentHuggingPriority(.required, for: .horizontal)
+
+        let outerStack = NSStackView(views: [contentStack, buttonStack])
+        outerStack.orientation = .vertical
+        outerStack.spacing = 16
+        outerStack.alignment = .leading
+        contentStack.setContentHuggingPriority(.defaultLow, for: .vertical)
+
+        // buttonStack 拉伸到与外层等宽
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        buttonStack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            contentStack.leadingAnchor.constraint(equalTo: outerStack.leadingAnchor),
+            contentStack.trailingAnchor.constraint(equalTo: outerStack.trailingAnchor),
+            buttonStack.leadingAnchor.constraint(equalTo: outerStack.leadingAnchor),
+            buttonStack.trailingAnchor.constraint(equalTo: outerStack.trailingAnchor),
+        ])
+
+        let panel = EscClosablePanel(
+            contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 200),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "关于"
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+
+        let contentView = NSView()
+        contentView.addSubview(outerStack)
+        outerStack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            outerStack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: topPadding),
+            outerStack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: horizontalPadding),
+            outerStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -horizontalPadding),
+            outerStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -bottomPadding),
+        ])
+        panel.contentView = contentView
+
+        // 依据内容自适应高度
+        contentView.layoutSubtreeIfNeeded()
+        let fittingHeight = outerStack.fittingSize.height + topPadding + bottomPadding
+        panel.setContentSize(NSSize(width: panelWidth, height: fittingHeight))
+
+        // 按钮点击 -> 关闭面板 (退出 modal loop)
+        okButton.target = panel
+        okButton.action = #selector(NSPanel.close)
+        panel.standardWindowButton(.closeButton)?.target = panel
+        panel.standardWindowButton(.closeButton)?.action = #selector(NSPanel.close)
+
+        panel.initialFirstResponder = okButton
+        panel.defaultButtonCell = okButton.cell as? NSButtonCell
+
+        runAppModal(panel: panel)
     }
 
     /// "配置" 面板: 单页分区平铺, 包含基本配置 / 数据库信息 / 日志信息.
+    /// 使用 app-modal 形式展示, 支持 Esc 关闭, 不阻塞切换到其他应用.
     @objc func showConfigPanel() {
         if let vc = window.contentViewController as? DictionaryViewController {
             vc.cancelFadeOut()
         }
 
-        let panelWidth: CGFloat = 460
-        let horizontalPadding: CGFloat = 20
-        let verticalPadding: CGFloat = 16
+        let panelWidth: CGFloat = 520
+        let horizontalPadding: CGFloat = 24
+        let topPadding: CGFloat = 16
+        let bottomPadding: CGFloat = 20
+        // 各 section 之间的垂直间隔 (比 contentStack.spacing 更大, 增强分组感)
+        let sectionSpacing: CGFloat = 14
+        let innerSpacing: CGFloat = 8
 
         let dbSize = AppPaths.databaseFileSize ?? 0
+        let wordCount = Database.shared.wordCount()
         let logFileList = AppPaths.logFiles
 
+        // 行内宽度 (用于 separator 和 row 对齐)
+        let rowWidth = panelWidth - horizontalPadding * 2
+
         // --- 基本配置 ---
+        let basicLabel = makeSectionHeader("基本配置")
         let fadeCheckbox = NSButton(checkboxWithTitle: "查询完成后自动淡出窗口", target: nil, action: nil)
         fadeCheckbox.state = AppConfig.shared.fadeOutEnabled ? .on : .off
 
-        // --- 数据库配置 ---
-        let dbSectionLabel = NSTextField(labelWithString: "数据库")
-        dbSectionLabel.font = NSFont.boldSystemFont(ofSize: 13)
+        // --- 数据库 ---
+        let dbSectionLabel = makeSectionHeader("数据库")
+        let dbInfoRight = "\(wordCount) 条 · \(AppPaths.formatFileSize(dbSize))"
+        let dbRow = makePathRow(path: AppPaths.databaseURL.path, rightText: dbInfoRight)
 
-        let dbPathAndSize = NSTextField(string: "\(AppPaths.databaseURL.path)  (\(AppPaths.formatFileSize(dbSize)))")
-        dbPathAndSize.isEditable = false
-        dbPathAndSize.drawsBackground = true
-        dbPathAndSize.backgroundColor = NSColor.controlBackgroundColor
-        dbPathAndSize.textColor = NSColor.disabledControlTextColor
-        dbPathAndSize.font = NSFont.systemFont(ofSize: 11)
-        dbPathAndSize.lineBreakMode = .byTruncatingMiddle
-
-        // --- 日志配置 ---
-        let logSectionLabel = NSTextField(labelWithString: "日志")
-        logSectionLabel.font = NSFont.boldSystemFont(ofSize: 13)
-
+        // --- 日志 ---
+        let logSectionLabel = makeSectionHeader("日志")
         let logStack = NSStackView()
         logStack.orientation = .vertical
-        logStack.spacing = 3
+        logStack.spacing = 4
         logStack.alignment = .leading
-        logStack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        logStack.translatesAutoresizingMaskIntoConstraints = false
 
         if logFileList.isEmpty {
             let emptyLabel = NSTextField(labelWithString: "无日志文件")
@@ -1485,62 +1599,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             logStack.addArrangedSubview(emptyLabel)
         } else {
             for entry in logFileList {
-                let row = NSStackView()
-                row.orientation = .horizontal
-                row.spacing = 8
-                row.alignment = .centerY
-
-                let pathField = NSTextField(string: entry.url.path)
-                pathField.isEditable = false
-                pathField.drawsBackground = true
-                pathField.backgroundColor = NSColor.controlBackgroundColor
-                pathField.textColor = NSColor.disabledControlTextColor
-                pathField.font = NSFont.systemFont(ofSize: 11)
-                pathField.lineBreakMode = .byTruncatingMiddle
-
-                let sizeLabel = NSTextField(labelWithString: AppPaths.formatFileSize(entry.size))
-                sizeLabel.font = NSFont.systemFont(ofSize: 11)
-                sizeLabel.textColor = NSColor.secondaryLabelColor
-
-                row.addArrangedSubview(pathField)
-                row.addArrangedSubview(sizeLabel)
-
-                pathField.setContentHuggingPriority(.defaultLow, for: .horizontal)
-                sizeLabel.setContentHuggingPriority(.required, for: .horizontal)
-
+                let row = makePathRow(path: entry.url.path, rightText: AppPaths.formatFileSize(entry.size))
                 logStack.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: logStack.widthAnchor).isActive = true
             }
         }
 
-        // --- 组装 ---
+        // --- 组装外层栈 ---
         let contentStack = NSStackView()
         contentStack.orientation = .vertical
-        contentStack.spacing = 6
+        contentStack.spacing = innerSpacing
         contentStack.alignment = .leading
-        contentStack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
 
-        // 基本配置区
-        let basicLabel = NSTextField(labelWithString: "基本配置")
-        basicLabel.font = NSFont.boldSystemFont(ofSize: 13)
         contentStack.addArrangedSubview(basicLabel)
         contentStack.addArrangedSubview(fadeCheckbox)
+        contentStack.setCustomSpacing(sectionSpacing, after: fadeCheckbox)
 
-        contentStack.addArrangedSubview(makeSeparator(width: panelWidth - horizontalPadding * 2))
+        let sep1 = makeSeparator()
+        contentStack.addArrangedSubview(sep1)
+        contentStack.setCustomSpacing(sectionSpacing, after: sep1)
 
-        // 数据库配置区
         contentStack.addArrangedSubview(dbSectionLabel)
-        contentStack.addArrangedSubview(dbPathAndSize)
+        contentStack.addArrangedSubview(dbRow)
+        contentStack.setCustomSpacing(sectionSpacing, after: dbRow)
 
-        contentStack.addArrangedSubview(makeSeparator(width: panelWidth - horizontalPadding * 2))
+        let sep2 = makeSeparator()
+        contentStack.addArrangedSubview(sep2)
+        contentStack.setCustomSpacing(sectionSpacing, after: sep2)
 
-        // 日志配置区
         contentStack.addArrangedSubview(logSectionLabel)
         contentStack.addArrangedSubview(logStack)
 
-        // 设置宽度约束让子视图撑满
-        contentStack.setFrameSize(NSSize(width: panelWidth - horizontalPadding * 2, height: 0))
+        // 让行内元素撑满内容宽度
+        dbRow.widthAnchor.constraint(equalToConstant: rowWidth).isActive = true
+        sep1.widthAnchor.constraint(equalToConstant: rowWidth).isActive = true
+        sep2.widthAnchor.constraint(equalToConstant: rowWidth).isActive = true
+        logStack.widthAnchor.constraint(equalToConstant: rowWidth).isActive = true
 
-        let panel = NSPanel(
+        let panel = EscClosablePanel(
             contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 100),
             styleMask: [.titled, .closable],
             backing: .buffered,
@@ -1548,61 +1645,117 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         panel.title = "配置"
         panel.isReleasedWhenClosed = false
-        panel.contentView = contentStack
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+
+        let contentView = NSView()
+        contentView.addSubview(contentStack)
+        NSLayoutConstraint.activate([
+            contentStack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: topPadding),
+            contentStack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: horizontalPadding),
+            contentStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -horizontalPadding),
+            contentStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -bottomPadding),
+        ])
+        panel.contentView = contentView
         panel.initialFirstResponder = fadeCheckbox
 
-        // 计算窗口高度: 内容高度 + padding*2
-        contentStack.layoutSubtreeIfNeeded()
-        let contentHeight = contentStack.fittingSize.height + verticalPadding * 2
-        panel.setContentSize(NSSize(width: panelWidth, height: contentHeight))
+        // 自适应高度
+        contentView.layoutSubtreeIfNeeded()
+        let fittingHeight = contentStack.fittingSize.height + topPadding + bottomPadding
+        panel.setContentSize(NSSize(width: panelWidth, height: fittingHeight))
 
-        // 居中并添加内边距
-        contentStack.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            contentStack.topAnchor.constraint(equalTo: panel.contentView!.topAnchor, constant: verticalPadding),
-            contentStack.leadingAnchor.constraint(equalTo: panel.contentView!.leadingAnchor, constant: horizontalPadding),
-            contentStack.trailingAnchor.constraint(equalTo: panel.contentView!.trailingAnchor, constant: -horizontalPadding),
-            contentStack.bottomAnchor.constraint(lessThanOrEqualTo: panel.contentView!.bottomAnchor, constant: -verticalPadding),
-        ])
+        panel.standardWindowButton(.closeButton)?.target = panel
+        panel.standardWindowButton(.closeButton)?.action = #selector(NSPanel.close)
+
+        // 运行 app-modal 循环 —— 阻塞本应用 UI, 但不影响切换到其他应用
+        runAppModal(panel: panel)
+
+        // Modal 结束后 (面板已关闭) 保存配置
+        let newEnabled = (fadeCheckbox.state == .on)
+        let oldEnabled = AppConfig.shared.fadeOutEnabled
+        AppConfig.shared.fadeOutEnabled = newEnabled
+
+        if !newEnabled {
+            if let vc = self.window.contentViewController as? DictionaryViewController {
+                vc.cancelFadeOut()
+            }
+        } else if newEnabled && !oldEnabled {
+            if let vc = self.window.contentViewController as? DictionaryViewController {
+                if vc.hasSearched {
+                    vc.startFadeOutCountdown()
+                }
+            }
+        }
+    }
+
+    /// 以 app-modal 形式运行 panel, 并在 panel 关闭时退出 modal loop.
+    /// app-modal 阻塞自身 UI 但不阻塞切换到其他应用; Esc 由 EscClosablePanel 处理.
+    private func runAppModal(panel: NSPanel) {
+        // 关闭事件 -> stopModal
+        let token = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: panel,
+            queue: .main
+        ) { _ in
+            NSApp.stopModal()
+        }
 
         NSApp.activate(ignoringOtherApps: true)
         panel.center()
         panel.makeKeyAndOrderFront(nil)
 
-        panel.standardWindowButton(.closeButton)?.target = panel
-        panel.standardWindowButton(.closeButton)?.action = #selector(NSPanel.close)
+        NSApp.runModal(for: panel)
 
-        // 监听窗口关闭通知以保存配置
-        _ = NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification,
-            object: panel,
-            queue: .main
-        ) { [weak self] _ in
-            guard let self = self else { return }
-            let newEnabled = (fadeCheckbox.state == .on)
-            let oldEnabled = AppConfig.shared.fadeOutEnabled
-            AppConfig.shared.fadeOutEnabled = newEnabled
-
-            if !newEnabled {
-                if let vc = self.window.contentViewController as? DictionaryViewController {
-                    vc.cancelFadeOut()
-                }
-            } else if newEnabled && !oldEnabled {
-                if let vc = self.window.contentViewController as? DictionaryViewController {
-                    if vc.hasSearched {
-                        vc.startFadeOutCountdown()
-                    }
-                }
-            }
-            NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: panel)
-        }
+        NotificationCenter.default.removeObserver(token)
     }
 
-    private func makeSeparator(width: CGFloat) -> NSView {
+    /// section 标题: 加粗 13pt
+    private func makeSectionHeader(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.boldSystemFont(ofSize: 13)
+        label.textColor = .labelColor
+        return label
+    }
+
+    /// 生成一行 "路径 + 右侧说明文本" 的只读展示行 (用于 DB 路径和日志路径).
+    /// 路径字段无背景 + secondaryLabelColor, 表达 "信息性只读", 但仍可选中复制.
+    private func makePathRow(path: String, rightText: String) -> NSView {
+        let pathField = NSTextField(labelWithString: path)
+        pathField.isEditable = false
+        pathField.isSelectable = true
+        pathField.isBordered = false
+        pathField.drawsBackground = false
+        pathField.backgroundColor = .clear
+        pathField.textColor = .secondaryLabelColor
+        pathField.font = NSFont.systemFont(ofSize: 11)
+        pathField.lineBreakMode = .byTruncatingMiddle
+        pathField.cell?.truncatesLastVisibleLine = true
+        pathField.maximumNumberOfLines = 1
+
+        let rightLabel = NSTextField(labelWithString: rightText)
+        rightLabel.font = NSFont.systemFont(ofSize: 11)
+        rightLabel.textColor = .secondaryLabelColor
+        rightLabel.isSelectable = true
+
+        let row = NSStackView(views: [pathField, rightLabel])
+        row.orientation = .horizontal
+        row.spacing = 12
+        row.alignment = .firstBaseline
+        row.distribution = .fill
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        pathField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        pathField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        rightLabel.setContentHuggingPriority(.required, for: .horizontal)
+        rightLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        return row
+    }
+
+    private func makeSeparator() -> NSView {
         let sep = NSBox()
         sep.boxType = .separator
         sep.translatesAutoresizingMaskIntoConstraints = false
-        sep.widthAnchor.constraint(equalToConstant: width).isActive = true
         return sep
     }
     

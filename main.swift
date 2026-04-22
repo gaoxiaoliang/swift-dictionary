@@ -1152,6 +1152,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var rightCmdTriggerPending = false
     /// 跟踪 Right Cmd 按下/释放状态, 用 toggle() 切换以避免左右 Cmd 同时按下时判断错误
     private var rightCmdIsDown = false
+    // 单击 Right Option 检测 (窗口可见时聚焦搜索框)
+    private var rightOptTriggerPending = false
+    private var rightOptIsDown = false
     private var globalFlagsMonitor: Any?
     private var localFlagsMonitor: Any?
     private var globalKeyDownMonitor: Any?
@@ -1216,44 +1219,77 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.processKeyDown()
             return event
         }
-        Logger.shared.log("App: Right Command 监听已安装 (单击模式, 组合键不触发)")
+        Logger.shared.log("App: Right Command / Right Option 监听已安装 (单击模式, 组合键不触发)")
     }
     
     /// HID key code: 左 Command = 55, 右 Command = 54
     private static let rightCommandKeyCode: UInt16 = 54
+    /// HID key code: 左 Option = 58, 右 Option = 61
+    private static let rightOptionKeyCode: UInt16 = 61
     
     private func processFlagsChanged(_ event: NSEvent) {
-        // 若 Right Cmd 待触发期间有其他修饰键变化, 说明用户在按组合键, 取消触发
-        if rightCmdTriggerPending && event.keyCode != AppDelegate.rightCommandKeyCode {
+        // 若 Right Cmd/Option 待触发期间有其他修饰键变化, 说明用户在按组合键, 取消所有待触发
+        if (rightCmdTriggerPending || rightOptTriggerPending)
+            && event.keyCode != AppDelegate.rightCommandKeyCode
+            && event.keyCode != AppDelegate.rightOptionKeyCode {
             rightCmdTriggerPending = false
+            rightOptTriggerPending = false
             return
         }
 
-        guard event.keyCode == AppDelegate.rightCommandKeyCode else { return }
+        // Right Command 处理
+        if event.keyCode == AppDelegate.rightCommandKeyCode {
+            rightCmdIsDown.toggle()
+            if rightCmdIsDown {
+                rightCmdTriggerPending = true
+            } else {
+                if rightCmdTriggerPending {
+                    rightCmdTriggerPending = false
+                    Logger.shared.log("App: 检测到单击 Right Command")
+                    DispatchQueue.main.async { [weak self] in
+                        self?.toggleWindow()
+                    }
+                }
+            }
+            return
+        }
 
-        // 用 toggle 跟踪按下/释放状态, 避免左右 Cmd 同时按下时 .command 标志位误判
-        rightCmdIsDown.toggle()
-
-        if rightCmdIsDown {
-            // 按下 Right Cmd → 标记待触发
-            rightCmdTriggerPending = true
-        } else {
-            // 释放 Right Cmd → 若仍待触发 (没有其他键被按下), 则切换窗口
-            if rightCmdTriggerPending {
-                rightCmdTriggerPending = false
-                Logger.shared.log("App: 检测到单击 Right Command")
-                DispatchQueue.main.async { [weak self] in
-                    self?.toggleWindow()
+        // Right Option 处理 (仅窗口可见时聚焦搜索框)
+        if event.keyCode == AppDelegate.rightOptionKeyCode {
+            rightOptIsDown.toggle()
+            if rightOptIsDown {
+                rightOptTriggerPending = true
+            } else {
+                if rightOptTriggerPending {
+                    rightOptTriggerPending = false
+                    Logger.shared.log("App: 检测到单击 Right Option")
+                    DispatchQueue.main.async { [weak self] in
+                        self?.focusSearchField()
+                    }
                 }
             }
         }
     }
 
-    /// 任何普通按键按下时, 若 Right Cmd 处于待触发状态, 说明用户在使用组合快捷键, 取消触发
-    private func processKeyDown() {
-        if rightCmdTriggerPending {
-            rightCmdTriggerPending = false
+    /// 将焦点移到搜索框 (窗口可见时激活并聚焦, 不可见时忽略)
+    private func focusSearchField() {
+        guard window.isVisible else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        if let vc = window.contentViewController as? DictionaryViewController {
+            vc.searchField.becomeFirstResponder()
+            if !vc.searchField.stringValue.isEmpty,
+               let editor = vc.searchField.currentEditor() {
+                let end = editor.string.count
+                editor.selectedRange = NSRange(location: end, length: 0)
+            }
         }
+    }
+
+    /// 任何普通按键按下时, 若 Right Cmd/Option 处于待触发状态, 说明用户在使用组合快捷键, 取消触发
+    private func processKeyDown() {
+        rightCmdTriggerPending = false
+        rightOptTriggerPending = false
     }
     
     /// 将窗口水平居中并紧贴系统菜单栏下方

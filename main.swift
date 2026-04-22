@@ -1442,10 +1442,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if let vc = window.contentViewController as? DictionaryViewController {
                 DispatchQueue.main.async {
                     vc.searchField.becomeFirstResponder()
-                    // 如果搜索框已有内容 (上次查询的单词), 全选以便用户直接覆盖输入
                     if !vc.searchField.stringValue.isEmpty,
                        let editor = vc.searchField.currentEditor() {
-                        editor.selectAll(nil)
+                        let end = editor.string.count
+                        editor.selectedRange = NSRange(location: end, length: 0)
                     }
                 }
             }

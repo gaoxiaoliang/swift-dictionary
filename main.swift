@@ -1020,6 +1020,14 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         Logger.shared.log("View: 点击拼写建议 '\(word)'")
         searchField.stringValue = word
         searchWordAction()
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.searchField.becomeFirstResponder()
+            if let editor = self.searchField.currentEditor() {
+                let end = editor.string.count
+                editor.selectedRange = NSRange(location: end, length: 0)
+            }
+        }
         return true
     }
     

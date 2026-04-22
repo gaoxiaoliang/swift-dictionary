@@ -5,6 +5,10 @@ import AVFoundation
 import Carbon
 import SQLite3
 
+// SQLite destructor constants: SQLITE_TRANSIENT tells sqlite to copy the data immediately,
+// avoiding dangling pointer issues when binding temporary Swift-managed strings/blobs.
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 // MARK: - App Paths
 
 /// 应用用户态存储目录 (遵循 macOS 惯例).
@@ -129,7 +133,7 @@ class Database {
         }
         defer { sqlite3_finalize(stmt) }
         
-        sqlite3_bind_text(stmt, 1, (word.lowercased() as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (word.lowercased() as NSString).utf8String, -1, SQLITE_TRANSIENT)
         
         if sqlite3_step(stmt) == SQLITE_ROW {
             let phoneticPtr = sqlite3_column_text(stmt, 0)
@@ -168,24 +172,27 @@ class Database {
         }
         defer { sqlite3_finalize(stmt) }
         
-        sqlite3_bind_text(stmt, 1, (word.lowercased() as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (word.lowercased() as NSString).utf8String, -1, SQLITE_TRANSIENT)
         
         if let phonetic = phonetic {
-            sqlite3_bind_text(stmt, 2, (phonetic as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 2, (phonetic as NSString).utf8String, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 2)
         }
         
         if let audioData = audioData {
-            let ptr = audioData.withUnsafeBytes { $0.baseAddress }
-            sqlite3_bind_blob(stmt, 3, ptr, Int32(audioData.count), nil)
+            audioData.withUnsafeBytes { rawBuffer in
+                if let baseAddr = rawBuffer.baseAddress {
+                    sqlite3_bind_blob(stmt, 3, baseAddr, Int32(audioData.count), SQLITE_TRANSIENT)
+                }
+            }
         } else {
             sqlite3_bind_null(stmt, 3)
         }
         
         if let defData = try? JSONSerialization.data(withJSONObject: definitions, options: []),
            let defString = String(data: defData, encoding: .utf8) {
-            sqlite3_bind_text(stmt, 4, (defString as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 4, (defString as NSString).utf8String, -1, SQLITE_TRANSIENT)
         }
         
         if sqlite3_step(stmt) == SQLITE_DONE {
@@ -330,7 +337,8 @@ class YoudaoAPI {
             return
         }
         
-        let urlString = "https://dict.youdao.com/jsonapi?q=\(word)&client=deskdict&dict=ec&le=eng"
+        let encodedWord = word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word
+        let urlString = "https://dict.youdao.com/jsonapi?q=\(encodedWord)&client=deskdict&dict=ec&le=eng"
         guard let url = URL(string: urlString) else {
             Logger.shared.error("API: 无效URL", error: nil)
             completion(.failure(NSError(domain: "Invalid URL", code: -1)))
@@ -418,7 +426,7 @@ class YoudaoAPI {
                 Logger.shared.log("API: 查询成功 - \(result.definitions.count) 个释义, 内容: \(definitions)")
                 
                 if result.ukspeech != nil {
-                    let audioURL = URL(string: "https://dict.youdao.com/speech?word=\(word)&type=1")!
+                    let audioURL = URL(string: "https://dict.youdao.com/speech?word=\(word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word)&type=1")!
                     URLSession.shared.dataTask(with: audioURL) { audioData, _, _ in
                         if let audioData = audioData {
                             Database.shared.saveWord(word, phonetic: result.ukphone, audioData: audioData, definitions: result.definitions)
@@ -782,7 +790,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                 Logger.shared.error("View: 播放缓存音频失败", error: error)
             }
         } else if data.ukspeech != nil {
-            currentAudioURL = URL(string: "https://dict.youdao.com/speech?word=\(word)&type=1")
+            currentAudioURL = URL(string: "https://dict.youdao.com/speech?word=\(word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word)&type=1")
             Logger.shared.log("View: 准备播放发音")
             playAudioAction()
         }
@@ -1526,7 +1534,7 @@ if args.count > 1 {
                     print("  \(def)")
                 }
                 if data.ukspeech != nil {
-                    print("\n发音: https://dict.youdao.com/speech?word=\(word)&type=1")
+                    print("\n发音: https://dict.youdao.com/speech?word=\(word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word)&type=1")
                 }
                 app.terminate(nil)
             case .failure(let error):

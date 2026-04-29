@@ -1960,11 +1960,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         邮箱: \(AppInfo.developerEmail)
         GitHub: \(AppInfo.githubURL)
 
-        © 2026 \(AppInfo.developerName). MIT License.
-
         Commit: \(BuildInfo.commit)
         构建时间: \(BuildInfo.buildTime)
         构建模式: \(Logger.isDebugBuild ? "DEBUG" : "RELEASE")
+
+        © 2026 \(AppInfo.developerName). MIT License.
         """
         let infoLabel = NSTextField(wrappingLabelWithString: infoText)
         infoLabel.font = NSFont.systemFont(ofSize: 12)

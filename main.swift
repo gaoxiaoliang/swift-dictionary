@@ -316,7 +316,8 @@ class Database {
 final class Logger {
     static let shared = Logger()
 
-    private let logFile: URL?
+    private var logFile: URL?
+    private var currentLogDate: String = ""
     private let queue = DispatchQueue(label: "com.xiaoliang.SwiftDict.logger")
     private let timestampFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -335,8 +336,8 @@ final class Logger {
 
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd"
-        let dateStr = dateFormatter.string(from: Date())
-        logFile = AppPaths.logsDir.appendingPathComponent("SwiftDict-\(dateStr).log")
+        currentLogDate = dateFormatter.string(from: Date())
+        logFile = AppPaths.logsDir.appendingPathComponent("SwiftDict-\(currentLogDate).log")
 
         pruneOldLogs()
 
@@ -370,6 +371,16 @@ final class Logger {
 
         queue.async { [weak self] in
             guard let self = self else { return }
+
+            // 跨天自动切换日志文件并清理旧文件
+            let dateFormatter = DateFormatter()
+            dateFormatter.dateFormat = "yyyy-MM-dd"
+            let today = dateFormatter.string(from: Date())
+            if today != self.currentLogDate {
+                self.currentLogDate = today
+                self.logFile = AppPaths.logsDir.appendingPathComponent("SwiftDict-\(today).log")
+                self.pruneOldLogs()
+            }
 
             // 开发模式: 同时输出到 stdout
             if Logger.isDebugBuild {

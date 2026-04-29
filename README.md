@@ -1,9 +1,9 @@
-# swift-dict（词典）
+# SwiftDict（词典）
 
 一个追求「极致便捷」的 macOS 原生英汉词典小工具：常驻菜单栏、单键唤起、粘贴即查、查完即隐。
 
-- 应用名: 词典 (swift-dict)
-- Bundle ID: `com.xiaoliang.swift-dict`
+- 应用名: 词典 (SwiftDict)
+- Bundle ID: `com.xiaoliang.SwiftDict`
 - 仓库: <https://github.com/gaoxiaoliang/swift-dictionary>
 - 作者: Xiaoliang Gao &lt;xiaoliang.gao.dev@gmail.com&gt;
 
@@ -36,7 +36,7 @@
 
 - 首次查询成功后将「单词 / 音标 / 音频二进制 / 释义 JSON」写入 `words` 表
 - 命中缓存的后续查询不发任何网络请求，音频直接由 BLOB 读出播放
-- 数据库文件: `~/Library/Application Support/swift-dict/dictionary.db`
+- 数据库文件: `~/Library/Application Support/SwiftDict/dictionary.db`
 - 配置面板内展示当前词条数和数据库文件大小
 
 ### 2.3 快捷交互
@@ -71,7 +71,7 @@ Right Command / Right Option 通过 `NSEvent.addGlobalMonitorForEvents` 捕获 `
 
 ### 2.6 日志
 
-- 存储位置: `~/Library/Logs/swift-dict/swift-dict-<yyyy-MM-dd>.log`
+- 存储位置: `~/Library/Logs/SwiftDict/SwiftDict-<yyyy-MM-dd>.log`
 - DEBUG 构建: 日志同时写入 stdout 与文件；RELEASE 构建: 只写文件
 - 启动时自动清理「昨日之前」的旧日志文件（按 mtime）
 - 写入经由串行 `DispatchQueue` 序列化，避免并发冲突
@@ -81,7 +81,7 @@ Right Command / Right Option 通过 `NSEvent.addGlobalMonitorForEvents` 捕获 `
 直接带参调用二进制，查询结果打印到 stdout 后退出：
 
 ```
-./swift-dict hello
+./SwiftDict hello
 ```
 
 输出包含音标、释义列表，以及发音 URL。
@@ -107,7 +107,7 @@ Right Command / Right Option 通过 `NSEvent.addGlobalMonitorForEvents` 捕获 `
 
 - macOS 12.0 或更高（`LSMinimumSystemVersion=12.0`，见 `Resources/Info.plist.in`）
 - 全局快捷键（Right Command / Right Option）需要「辅助功能」权限
-  - 系统设置 → 隐私与安全性 → 辅助功能 → 添加并勾选 `swift-dict`
+  - 系统设置 → 隐私与安全性 → 辅助功能 → 添加并勾选 `SwiftDict`
   - 首次启动会弹出系统原生权限引导
 
 ---
@@ -142,7 +142,7 @@ swift-dictionary/
 │   └── make-dmg.sh             # 将 .app 打包成 DMG (hdiutil + /Applications 软链)
 ├── build/                      # 构建产物 (.app bundle, 已 gitignore)
 ├── dist/                       # DMG 发布产物 (已 gitignore)
-└── swift-dict                  # 生成的二进制 (已 gitignore)
+└── SwiftDict                    # 生成的二进制 (已 gitignore)
 ```
 
 源码主要组件（均在 `main.swift`）：
@@ -166,11 +166,11 @@ swift-dictionary/
 
 ```sh
 make               # 等价 make debug
-make debug         # 生成二进制 ./swift-dict (带 -D DEBUG, -g, -Onone)
-make release       # 生成二进制 ./swift-dict (-O)
+make debug         # 生成二进制 ./SwiftDict (带 -D DEBUG, -g, -Onone)
+make release       # 生成二进制 ./SwiftDict (-O)
 make run           # debug 构建后直接运行
-make app           # 构建 build/swift-dict.app (含 ad-hoc 代码签名)
-make dmg           # 打包 dist/swift-dict-<version>.dmg
+make app           # 构建 build/SwiftDict.app (含 ad-hoc 代码签名)
+make dmg           # 打包 dist/SwiftDict-<version>.dmg
 make clean         # 清理所有构建产物
 ```
 
@@ -190,9 +190,9 @@ make clean         # 清理所有构建产物
 
 | 路径 | 内容 |
 | --- | --- |
-| `~/Library/Application Support/swift-dict/dictionary.db` | SQLite 缓存（词条、音频 BLOB） |
-| `~/Library/Logs/swift-dict/swift-dict-YYYY-MM-DD.log` | 日志（自动按天轮转，只保留今日 + 昨日） |
-| `~/Library/Preferences/com.xiaoliang.swift-dict.plist` | `UserDefaults`（配置项如 `fadeOutEnabled`） |
+| `~/Library/Application Support/SwiftDict/dictionary.db` | SQLite 缓存（词条、音频 BLOB） |
+| `~/Library/Logs/SwiftDict/SwiftDict-YYYY-MM-DD.log` | 日志（自动按天轮转，只保留今日 + 昨日） |
+| `~/Library/Preferences/com.xiaoliang.SwiftDict.plist` | `UserDefaults`（配置项如 `fadeOutEnabled`） |
 
 所需权限：
 

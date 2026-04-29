@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>swift-dict</string>
+    <string>SwiftDict</string>
     <key>CFBundleDisplayName</key>
     <string>词典</string>
     <key>CFBundleIdentifier</key>
-    <string>com.xiaoliang.swift-dict</string>
+    <string>com.xiaoliang.SwiftDict</string>
     <key>CFBundleExecutable</key>
-    <string>swift-dict</string>
+    <string>SwiftDict</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

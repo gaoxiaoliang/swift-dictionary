@@ -1,16 +1,16 @@
-# swift-dict Makefile
+# SwiftDict Makefile
 #
 # Common targets:
 #   make            -> debug build (binary only, logs to stdout + file)
 #   make debug      -> same as `make`
 #   make release    -> release build (binary only, logs to file only)
-#   make app        -> build swift-dict.app bundle in build/
-#   make dmg        -> build DMG installer at dist/swift-dict-<version>.dmg
+#   make app        -> build SwiftDict.app bundle in build/
+#   make dmg        -> build DMG installer at dist/SwiftDict-<version>.dmg
 #   make run        -> build debug + run the binary
 #   make clean      -> remove all build artifacts
 
 SWIFTC        := swiftc
-TARGET        := swift-dict
+TARGET        := SwiftDict
 SOURCES       := main.swift BuildInfo.swift
 LIBS          := -lsqlite3
 
@@ -22,7 +22,7 @@ VERSION       := $(shell git describe --tags --always --dirty 2>/dev/null || ech
 # Paths
 BUILD_DIR     := build
 DIST_DIR      := dist
-APP_NAME      := swift-dict
+APP_NAME      := SwiftDict
 APP_BUNDLE    := $(BUILD_DIR)/$(APP_NAME).app
 DMG_PATH      := $(DIST_DIR)/$(APP_NAME)-$(VERSION).dmg
 VOL_NAME      := $(APP_NAME)

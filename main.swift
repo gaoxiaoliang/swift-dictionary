@@ -1,4 +1,4 @@
-// swift-dict: A native macOS dictionary app
+// SwiftDict: A native macOS dictionary app
 import Foundation
 import AppKit
 import AVFoundation
@@ -12,24 +12,49 @@ private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.sel
 // MARK: - App Paths
 
 /// 应用用户态存储目录 (遵循 macOS 惯例).
-/// - 数据库: ~/Library/Application Support/swift-dict/dictionary.db
-/// - 日志:   ~/Library/Logs/swift-dict/
+/// - 数据库: ~/Library/Application Support/SwiftDict/dictionary.db
+/// - 日志:   ~/Library/Logs/SwiftDict/
 enum AppPaths {
     static let appSupportDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return base.appendingPathComponent("swift-dict", isDirectory: true)
+        return base.appendingPathComponent("SwiftDict", isDirectory: true)
     }()
 
     static let logsDir: URL = {
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/swift-dict", isDirectory: true)
+            .appendingPathComponent("Library/Logs/SwiftDict", isDirectory: true)
     }()
 
     static let databaseURL: URL = appSupportDir.appendingPathComponent("dictionary.db")
 
+    private static let fm = FileManager.default
+
+    /// 旧版目录 (v1.x 使用 "swift-dict")，用于迁移数据和后续清理
+    private static let legacyAppSupportDir: URL = {
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return base.appendingPathComponent("swift-dict", isDirectory: true)
+    }()
+
+    private static let legacyLogsDir: URL = {
+        fm.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/swift-dict", isDirectory: true)
+    }()
+
     static func ensureDirectoriesExist() {
-        try? FileManager.default.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
-        try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        let legacyDB = legacyAppSupportDir.appendingPathComponent("dictionary.db")
+
+        // 迁移旧数据库: 移动 > 删除旧目录
+        if fm.fileExists(atPath: legacyDB.path), !fm.fileExists(atPath: databaseURL.path) {
+            try? fm.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
+            if let _ = try? fm.moveItem(at: legacyDB, to: databaseURL) {
+                // 迁移成功，清理旧目录 (尽力而为)
+                try? fm.removeItem(at: legacyAppSupportDir)
+                try? fm.removeItem(at: legacyLogsDir)
+            }
+        }
+
+        try? fm.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: logsDir, withIntermediateDirectories: true)
     }
 
     /// 数据库文件大小 (字节), 文件不存在返回 nil
@@ -95,6 +120,17 @@ class AppConfig {
         defaults.register(defaults: [
             Keys.fadeOutEnabled: true
         ])
+        migrateFromLegacyBundleIfNeeded()
+    }
+
+    /// 从旧版 bundle ID (com.xiaoliang.swift-dict) 迁移 UserDefaults 配置
+    private func migrateFromLegacyBundleIfNeeded() {
+        let legacySuite = "com.xiaoliang.swift-dict"
+        guard let legacy = UserDefaults(suiteName: legacySuite),
+              legacy.object(forKey: Keys.fadeOutEnabled) != nil else { return }
+        let oldValue = legacy.bool(forKey: Keys.fadeOutEnabled)
+        defaults.set(oldValue, forKey: Keys.fadeOutEnabled)
+        legacy.removePersistentDomain(forName: legacySuite)
     }
 
     var fadeOutEnabled: Bool {
@@ -251,13 +287,13 @@ class Database {
 // MARK: - Logger
 
 /// 开发模式 (DEBUG 构建): 日志同时写入 stdout 和文件;
-/// 生产模式 (RELEASE 构建): 日志仅写入 ~/Library/Logs/swift-dict/ 下的文件.
+/// 生产模式 (RELEASE 构建): 日志仅写入 ~/Library/Logs/SwiftDict/ 下的文件.
 /// 每次启动时清理超过 "昨日" 的旧日志文件 (保留今日 + 昨日两份).
 final class Logger {
     static let shared = Logger()
 
     private let logFile: URL?
-    private let queue = DispatchQueue(label: "com.xiaoliang.swift-dict.logger")
+    private let queue = DispatchQueue(label: "com.xiaoliang.SwiftDict.logger")
     private let timestampFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH:mm:ss"
@@ -276,7 +312,7 @@ final class Logger {
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd"
         let dateStr = dateFormatter.string(from: Date())
-        logFile = AppPaths.logsDir.appendingPathComponent("swift-dict-\(dateStr).log")
+        logFile = AppPaths.logsDir.appendingPathComponent("SwiftDict-\(dateStr).log")
 
         pruneOldLogs()
 
@@ -1272,7 +1308,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             Logger.shared.log("App: 辅助功能权限已授予")
         } else {
             Logger.shared.log("⚠️ App: 辅助功能权限未授予, Right Command 快捷键无法工作.")
-            Logger.shared.log("⚠️ App: 请在 系统偏好设置 → 安全性与隐私 → 隐私 → 辅助功能 中勾选 swift-dict, 然后重启应用.")
+            Logger.shared.log("⚠️ App: 请在 系统偏好设置 → 安全性与隐私 → 隐私 → 辅助功能 中勾选 SwiftDict, 然后重启应用.")
         }
     }
     

@@ -526,8 +526,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     private var escMonitor: Any?
     private var historyNavMonitor: Any?
 
-    private var wordHistory: [String] = []
-    private var historyIndex: Int = -1
+    private var backStack: [String] = []
+    private var forwardStack: [String] = []
+    private var historyCurrent: String?
     private let maxHistorySize = 100
     private var isNavigating = false
     
@@ -788,16 +789,43 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     }
 
     private func addToHistory(_ word: String) {
-        if historyIndex >= 0, historyIndex < wordHistory.count - 1 {
-            wordHistory = Array(wordHistory.prefix(historyIndex + 1))
-        }
-        if wordHistory.isEmpty || wordHistory.last != word {
-            wordHistory.append(word)
-            if wordHistory.count > maxHistorySize {
-                wordHistory.removeFirst()
+        // 与当前词相同则跳过
+        if word == historyCurrent { return }
+
+        // 将当前词推入后退栈 (若存在)
+        if let cur = historyCurrent {
+            backStack.append(cur)
+            if backStack.count > maxHistorySize {
+                backStack.removeFirst()
             }
         }
-        historyIndex = wordHistory.count - 1
+
+        // 新查询清空前进栈 (浏览器行为)
+        forwardStack.removeAll()
+        historyCurrent = word
+    }
+
+    private func navigateBack() {
+        guard let last = backStack.popLast() else { return }
+        // 当前词推入前进栈
+        if let cur = historyCurrent {
+            forwardStack.append(cur)
+        }
+        historyCurrent = last
+        displayHistoryWord(last)
+    }
+
+    private func navigateForward() {
+        guard let next = forwardStack.popLast() else { return }
+        // 当前词推入后退栈
+        if let cur = historyCurrent {
+            backStack.append(cur)
+            if backStack.count > maxHistorySize {
+                backStack.removeFirst()
+            }
+        }
+        historyCurrent = next
+        displayHistoryWord(next)
     }
 
     private func performQuery(for word: String) {
@@ -818,18 +846,6 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                 }
             }
         }
-    }
-
-    private func navigateBack() {
-        guard historyIndex > 0 else { return }
-        historyIndex -= 1
-        displayHistoryWord(wordHistory[historyIndex])
-    }
-
-    private func navigateForward() {
-        guard historyIndex < wordHistory.count - 1 else { return }
-        historyIndex += 1
-        displayHistoryWord(wordHistory[historyIndex])
     }
 
     private func displayHistoryWord(_ word: String) {

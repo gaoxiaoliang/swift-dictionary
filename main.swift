@@ -1954,9 +1954,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         titleLabel.textColor = .labelColor
 
         let infoText = """
+        \(AppInfo.displayName) \(BuildInfo.version)
+
         开发者: \(AppInfo.developerName)
         邮箱: \(AppInfo.developerEmail)
         GitHub: \(AppInfo.githubURL)
+
+        © 2026 \(AppInfo.developerName). MIT License.
 
         Commit: \(BuildInfo.commit)
         构建时间: \(BuildInfo.buildTime)

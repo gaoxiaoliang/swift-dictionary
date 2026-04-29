@@ -1276,7 +1276,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupWindow()
         Logger.shared.log("App: 窗口已设置 - frame: \(window.frame)")
         
-        checkAccessibilityPermission()
+        // checkAccessibilityPermission()
         installRightCommandMonitor()
         
         // 定位窗口到屏幕顶部 (菜单栏正下方)
@@ -1287,15 +1287,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Logger.shared.log("App: 窗口已显示 - isVisible: \(window.isVisible), frame: \(window.frame)")
     }
     
-    /// 静默检查辅助功能权限并记录日志 (不弹出系统授权窗, 用户可按需手动授权)
+    /// 首次启动检查辅助功能权限; 未授权则弹系统原生引导窗并在日志提示
     func checkAccessibilityPermission() {
         let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        let options: CFDictionary = [promptKey: false] as CFDictionary
+        let options: CFDictionary = [promptKey: true] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(options)
         if trusted {
             Logger.shared.log("App: 辅助功能权限已授予")
         } else {
-            Logger.shared.log("⚠️ App: 辅助功能权限未授予, 非活跃状态下 Right Command/Option 全局快捷键无法工作.")
+            Logger.shared.log("⚠️ App: 辅助功能权限未授予, Right Command 快捷键无法工作.")
             Logger.shared.log("⚠️ App: 请在 系统偏好设置 → 安全性与隐私 → 隐私 → 辅助功能 中勾选 SwiftDict, 然后重启应用.")
         }
     }

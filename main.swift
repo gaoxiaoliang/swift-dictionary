@@ -70,7 +70,7 @@ enum AppPaths {
 
 /// 静态开发者/应用信息, 供 "关于" 面板和窗口标题使用.
 enum AppInfo {
-    static let displayName = "词典"
+    static let displayName = "SwiftDict"
     static let developerName = "Xiaoliang Gao"
     static let developerEmail = "xiaoliang.gao.dev@gmail.com"
     static let githubURL = "https://github.com/gaoxiaoliang/swift-dictionary"
@@ -1586,38 +1586,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         infoLabel.textColor = .labelColor
         infoLabel.isSelectable = true
 
-        let okButton = NSButton(title: "好的", target: nil, action: nil)
-        okButton.bezelStyle = .rounded
-        okButton.keyEquivalent = "\r"  // 回车键等价于点击
-
         let contentStack = NSStackView(views: [titleLabel, infoLabel])
         contentStack.orientation = .vertical
         contentStack.spacing = 12
         contentStack.alignment = .leading
-
-        let buttonStack = NSStackView(views: [NSView(), okButton])
-        buttonStack.orientation = .horizontal
-        buttonStack.distribution = .fill
-        buttonStack.alignment = .centerY
-        // 让占位 view 吸收左侧空间, 按钮靠右
-        buttonStack.views.first?.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        okButton.setContentHuggingPriority(.required, for: .horizontal)
-
-        let outerStack = NSStackView(views: [contentStack, buttonStack])
-        outerStack.orientation = .vertical
-        outerStack.spacing = 16
-        outerStack.alignment = .leading
-        contentStack.setContentHuggingPriority(.defaultLow, for: .vertical)
-
-        // buttonStack 拉伸到与外层等宽
-        contentStack.translatesAutoresizingMaskIntoConstraints = false
-        buttonStack.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            contentStack.leadingAnchor.constraint(equalTo: outerStack.leadingAnchor),
-            contentStack.trailingAnchor.constraint(equalTo: outerStack.trailingAnchor),
-            buttonStack.leadingAnchor.constraint(equalTo: outerStack.leadingAnchor),
-            buttonStack.trailingAnchor.constraint(equalTo: outerStack.trailingAnchor),
-        ])
 
         let panel = EscClosablePanel(
             contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 200),
@@ -1631,29 +1603,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = .floating
 
         let contentView = NSView()
-        contentView.addSubview(outerStack)
-        outerStack.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(contentStack)
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            outerStack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: topPadding),
-            outerStack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: horizontalPadding),
-            outerStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -horizontalPadding),
-            outerStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -bottomPadding),
+            contentStack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: topPadding),
+            contentStack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: horizontalPadding),
+            contentStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -horizontalPadding),
+            contentStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -bottomPadding),
         ])
         panel.contentView = contentView
 
         // 依据内容自适应高度
         contentView.layoutSubtreeIfNeeded()
-        let fittingHeight = outerStack.fittingSize.height + topPadding + bottomPadding
+        let fittingHeight = contentStack.fittingSize.height + topPadding + bottomPadding
         panel.setContentSize(NSSize(width: panelWidth, height: fittingHeight))
 
-        // 按钮点击 -> 关闭面板 (退出 modal loop)
-        okButton.target = panel
-        okButton.action = #selector(NSPanel.close)
         panel.standardWindowButton(.closeButton)?.target = panel
         panel.standardWindowButton(.closeButton)?.action = #selector(NSPanel.close)
-
-        panel.initialFirstResponder = okButton
-        panel.defaultButtonCell = okButton.cell as? NSButtonCell
 
         runAppModal(panel: panel)
     }

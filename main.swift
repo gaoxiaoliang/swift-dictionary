@@ -523,6 +523,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     var displayedWord: String = ""
     
     private var pasteMonitor: Any?
+    private var escMonitor: Any?
     
     // 淡出相关
     private var fadeOutTimer: Timer?
@@ -663,10 +664,14 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         scrollViewHeightConstraint.isActive = true
         
         installPasteMonitor()
+        installEscMonitor()
     }
     
     deinit {
         if let monitor = pasteMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+        if let monitor = escMonitor {
             NSEvent.removeMonitor(monitor)
         }
     }
@@ -697,6 +702,23 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                 return nil  // 吞掉事件, 防止系统默认粘贴再跑一遍
             }
             return event
+        }
+    }
+    
+    /// Esc 键隐藏主窗口 (仅在窗口为 key window 时生效, 不干扰 About/Config 面板)
+    private func installEscMonitor() {
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 53,
+                  let self = self,
+                  let window = self.view.window,
+                  window.isKeyWindow else { return event }
+            Logger.shared.log("View: Esc 隐藏窗口")
+            DispatchQueue.main.async {
+                if let appDelegate = NSApp.delegate as? AppDelegate {
+                    appDelegate.toggleWindow()
+                }
+            }
+            return nil
         }
     }
     

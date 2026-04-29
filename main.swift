@@ -89,11 +89,15 @@ class AppConfig {
 
     private enum Keys {
         static let fadeOutEnabled = "fadeOutEnabled"
+        static let showRelatedWords = "showRelatedWords"
+        static let showSynonyms = "showSynonyms"
     }
 
     init() {
         defaults.register(defaults: [
-            Keys.fadeOutEnabled: true
+            Keys.fadeOutEnabled: true,
+            Keys.showRelatedWords: false,
+            Keys.showSynonyms: false
         ])
     }
 
@@ -102,6 +106,22 @@ class AppConfig {
         set {
             defaults.set(newValue, forKey: Keys.fadeOutEnabled)
             Logger.shared.log("Config: fadeOutEnabled -> \(newValue)")
+        }
+    }
+
+    var showRelatedWords: Bool {
+        get { defaults.bool(forKey: Keys.showRelatedWords) }
+        set {
+            defaults.set(newValue, forKey: Keys.showRelatedWords)
+            Logger.shared.log("Config: showRelatedWords -> \(newValue)")
+        }
+    }
+
+    var showSynonyms: Bool {
+        get { defaults.bool(forKey: Keys.showSynonyms) }
+        set {
+            defaults.set(newValue, forKey: Keys.showSynonyms)
+            Logger.shared.log("Config: showSynonyms -> \(newValue)")
         }
     }
 }
@@ -154,11 +174,20 @@ class Database {
         }
         sqlite3_finalize(stmt)
         
+        // 新增字段: 其他词性、近义词
+        let alterSQLs = [
+            "ALTER TABLE words ADD COLUMN related_words TEXT",
+            "ALTER TABLE words ADD COLUMN synonyms TEXT"
+        ]
+        for sql in alterSQLs {
+            sqlite3_exec(db, sql, nil, nil, nil)
+        }
+        
         Logger.shared.log("DB: 表已准备就绪")
     }
     
     func getWord(_ word: String) -> YoudaoResult? {
-        let querySQL = "SELECT phonetics_uk, audio_data_uk, definitions FROM words WHERE word = ?"
+        let querySQL = "SELECT phonetics_uk, audio_data_uk, definitions, related_words, synonyms FROM words WHERE word = ?"
         var stmt: OpaquePointer?
         
         guard sqlite3_prepare_v2(db, querySQL, -1, &stmt, nil) == SQLITE_OK else {
@@ -184,6 +213,20 @@ class Database {
                let defArray = try? JSONSerialization.jsonObject(with: defStr) as? [String] {
                 result.definitions = defArray
             }
+
+            // 读取其他词性
+            if let relPtr = sqlite3_column_text(stmt, 3),
+               let relData = String(cString: relPtr).data(using: .utf8),
+               let relArray = try? JSONDecoder().decode([RelatedWordGroup].self, from: relData) {
+                result.relatedWordGroups = relArray
+            }
+
+            // 读取近义词
+            if let synPtr = sqlite3_column_text(stmt, 4),
+               let synData = String(cString: synPtr).data(using: .utf8),
+               let synArray = try? JSONDecoder().decode([SynonymGroup].self, from: synData) {
+                result.synonymGroups = synArray
+            }
             
             Logger.shared.log("DB: 命中缓存 - \(word)")
             return result
@@ -206,10 +249,11 @@ class Database {
         return 0
     }
 
-    func saveWord(_ word: String, phonetic: String?, audioData: Data?, definitions: [String]) {
+    func saveWord(_ word: String, phonetic: String?, audioData: Data?, definitions: [String],
+                  relatedWordGroups: [RelatedWordGroup], synonymGroups: [SynonymGroup]) {
         let insertSQL = """
-            INSERT OR REPLACE INTO words (word, phonetics_uk, audio_data_uk, definitions, created_at, updated_at)
-            VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
+            INSERT OR REPLACE INTO words (word, phonetics_uk, audio_data_uk, definitions, related_words, synonyms, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
         """
         var stmt: OpaquePointer?
         
@@ -240,6 +284,22 @@ class Database {
         if let defData = try? JSONSerialization.data(withJSONObject: definitions, options: []),
            let defString = String(data: defData, encoding: .utf8) {
             sqlite3_bind_text(stmt, 4, (defString as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        }
+
+        // 其他词性 (JSON)
+        if let relData = try? JSONEncoder().encode(relatedWordGroups),
+           let relString = String(data: relData, encoding: .utf8) {
+            sqlite3_bind_text(stmt, 5, (relString as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 5)
+        }
+
+        // 近义词 (JSON)
+        if let synData = try? JSONEncoder().encode(synonymGroups),
+           let synString = String(data: synData, encoding: .utf8) {
+            sqlite3_bind_text(stmt, 6, (synString as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 6)
         }
         
         if sqlite3_step(stmt) == SQLITE_DONE {
@@ -340,11 +400,29 @@ final class Logger {
 
 // MARK: - API Response
 
+struct RelatedWord: Codable {
+    let word: String
+    let translation: String
+}
+
+struct RelatedWordGroup: Codable {
+    let pos: String
+    let words: [RelatedWord]
+}
+
+struct SynonymGroup: Codable {
+    let pos: String
+    let synonyms: [String]
+    let translation: String
+}
+
 struct YoudaoResult {
     var ukphone: String?
     var ukspeech: String?     // URL string from API (network)
     var cachedAudioData: Data?  // Cached audio data from DB
     var definitions: [String] = []
+    var relatedWordGroups: [RelatedWordGroup] = []
+    var synonymGroups: [SynonymGroup] = []
 }
 
 /// 拼写建议 (词条未收录时由有道返回的 typos.typo)
@@ -469,6 +547,42 @@ class YoudaoAPI {
                 }
                 
                 result.definitions = definitions
+
+                // 解析其他词性 (rel_word)
+                if let relWord = json["rel_word"] as? [String: Any],
+                   let rels = relWord["rels"] as? [[String: Any]] {
+                    var relGroups: [RelatedWordGroup] = []
+                    for relEntry in rels {
+                        guard let rel = relEntry["rel"] as? [String: Any],
+                              let pos = rel["pos"] as? String,
+                              let wordList = rel["words"] as? [[String: Any]] else { continue }
+                        let words = wordList.compactMap { w -> RelatedWord? in
+                            guard let wStr = w["word"] as? String else { return nil }
+                            return RelatedWord(word: wStr, translation: (w["tran"] as? String) ?? "")
+                        }
+                        if !words.isEmpty {
+                            relGroups.append(RelatedWordGroup(pos: pos, words: words))
+                        }
+                    }
+                    result.relatedWordGroups = relGroups
+                }
+
+                // 解析近义词 (syno)
+                if let syno = json["syno"] as? [String: Any],
+                   let synos = syno["synos"] as? [[String: Any]] {
+                    var synGroups: [SynonymGroup] = []
+                    for synEntry in synos {
+                        guard let syn = synEntry["syno"] as? [String: Any],
+                              let pos = syn["pos"] as? String,
+                              let ws = syn["ws"] as? [[String: Any]] else { continue }
+                        let synonyms = ws.compactMap { $0["w"] as? String }
+                        let tran = (syn["tran"] as? String) ?? ""
+                        if !synonyms.isEmpty {
+                            synGroups.append(SynonymGroup(pos: pos, synonyms: synonyms, translation: tran))
+                        }
+                    }
+                    result.synonymGroups = synGroups
+                }
                 
                 Logger.shared.log("API: 查询成功 - \(result.definitions.count) 个释义, 内容: \(definitions)")
                 
@@ -476,7 +590,10 @@ class YoudaoAPI {
                     let audioURL = URL(string: "https://dict.youdao.com/speech?word=\(word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word)&type=1")!
                     URLSession.shared.dataTask(with: audioURL) { audioData, _, _ in
                         if let audioData = audioData {
-                            Database.shared.saveWord(word, phonetic: result.ukphone, audioData: audioData, definitions: result.definitions)
+                            Database.shared.saveWord(word, phonetic: result.ukphone, audioData: audioData,
+                                                     definitions: result.definitions,
+                                                     relatedWordGroups: result.relatedWordGroups,
+                                                     synonymGroups: result.synonymGroups)
                         }
                     }.resume()
                 }
@@ -531,6 +648,21 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     private var historyCurrent: String?
     private let maxHistorySize = 100
     private var isNavigating = false
+
+    // 其他词性 & 近义词 区域
+    var relatedWordsScrollView: NSScrollView!
+    var relatedWordsTextView: NSTextView!
+    var relatedWordsHeightConstraint: NSLayoutConstraint!
+    var relatedWordsExpanded = false
+
+    var synonymsScrollView: NSScrollView!
+    var synonymsTextView: NSTextView!
+    var synonymsHeightConstraint: NSLayoutConstraint!
+    var synonymsExpanded = false
+
+    // 内容缓存 (nil = API 未返回或为空)
+    private var relatedWordAttributedContent: NSAttributedString?
+    private var synonymAttributedContent: NSAttributedString?
     
     // 淡出相关
     private var fadeOutTimer: Timer?
@@ -631,6 +763,58 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         ]
         scrollView.documentView = definitionsTextView
         view.addSubview(scrollView)
+
+        // 其他词性区域
+        relatedWordsScrollView = NSScrollView()
+        relatedWordsScrollView.translatesAutoresizingMaskIntoConstraints = false
+        relatedWordsScrollView.hasVerticalScroller = false
+        relatedWordsScrollView.borderType = .noBorder
+        relatedWordsScrollView.drawsBackground = false
+        relatedWordsTextView = NSTextView(frame: NSRect(x: 0, y: 0, width: textViewWidth, height: 0))
+        relatedWordsTextView.isEditable = false
+        relatedWordsTextView.isSelectable = true
+        relatedWordsTextView.font = NSFont.systemFont(ofSize: 13)
+        relatedWordsTextView.textColor = .labelColor
+        relatedWordsTextView.backgroundColor = .clear
+        relatedWordsTextView.textContainerInset = NSSize(width: 0, height: 0)
+        relatedWordsTextView.textContainer?.containerSize = NSSize(width: textViewWidth, height: CGFloat.greatestFiniteMagnitude)
+        relatedWordsTextView.textContainer?.widthTracksTextView = true
+        relatedWordsTextView.textContainer?.lineFragmentPadding = 0
+        relatedWordsTextView.delegate = self
+        relatedWordsTextView.linkTextAttributes = [
+            .foregroundColor: NSColor.linkColor,
+            .cursor: NSCursor.pointingHand,
+            .underlineStyle: NSUnderlineStyle.single.rawValue
+        ]
+        relatedWordsScrollView.documentView = relatedWordsTextView
+        relatedWordsScrollView.isHidden = true
+        view.addSubview(relatedWordsScrollView)
+
+        // 近义词区域
+        synonymsScrollView = NSScrollView()
+        synonymsScrollView.translatesAutoresizingMaskIntoConstraints = false
+        synonymsScrollView.hasVerticalScroller = false
+        synonymsScrollView.borderType = .noBorder
+        synonymsScrollView.drawsBackground = false
+        synonymsTextView = NSTextView(frame: NSRect(x: 0, y: 0, width: textViewWidth, height: 0))
+        synonymsTextView.isEditable = false
+        synonymsTextView.isSelectable = true
+        synonymsTextView.font = NSFont.systemFont(ofSize: 13)
+        synonymsTextView.textColor = .labelColor
+        synonymsTextView.backgroundColor = .clear
+        synonymsTextView.textContainerInset = NSSize(width: 0, height: 0)
+        synonymsTextView.textContainer?.containerSize = NSSize(width: textViewWidth, height: CGFloat.greatestFiniteMagnitude)
+        synonymsTextView.textContainer?.widthTracksTextView = true
+        synonymsTextView.textContainer?.lineFragmentPadding = 0
+        synonymsTextView.delegate = self
+        synonymsTextView.linkTextAttributes = [
+            .foregroundColor: NSColor.linkColor,
+            .cursor: NSCursor.pointingHand,
+            .underlineStyle: NSUnderlineStyle.single.rawValue
+        ]
+        synonymsScrollView.documentView = synonymsTextView
+        synonymsScrollView.isHidden = true
+        view.addSubview(synonymsScrollView)
         
         loadingIndicator = NSProgressIndicator()
         loadingIndicator.style = .spinning
@@ -662,6 +846,14 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             scrollView.topAnchor.constraint(equalTo: wordLabel.bottomAnchor, constant: 20),
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+
+            relatedWordsScrollView.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 12),
+            relatedWordsScrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            relatedWordsScrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+
+            synonymsScrollView.topAnchor.constraint(equalTo: relatedWordsScrollView.bottomAnchor, constant: 12),
+            synonymsScrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            synonymsScrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
             
             loadingIndicator.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             loadingIndicator.centerYAnchor.constraint(equalTo: view.centerYAnchor),
@@ -669,6 +861,12 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         
         scrollViewHeightConstraint = scrollView.heightAnchor.constraint(equalToConstant: 0)
         scrollViewHeightConstraint.isActive = true
+
+        relatedWordsHeightConstraint = relatedWordsScrollView.heightAnchor.constraint(equalToConstant: 0)
+        relatedWordsHeightConstraint.isActive = true
+
+        synonymsHeightConstraint = synonymsScrollView.heightAnchor.constraint(equalToConstant: 0)
+        synonymsHeightConstraint.isActive = true
         
         installPasteMonitor()
         installEscMonitor()
@@ -870,6 +1068,25 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                   !event.modifierFlags.contains(.shift),
                   !event.modifierFlags.contains(.control) else { return event }
 
+            // 上下方向键: 仅搜索框聚焦时展开/收缩 section
+            if event.keyCode == 125 || event.keyCode == 126 {
+                let searchFocused: Bool = {
+                    guard let responder = window.firstResponder else { return false }
+                    if responder === self.searchField { return true }
+                    if let editor = self.searchField.currentEditor(), responder === editor { return true }
+                    return false
+                }()
+                if searchFocused {
+                    if event.keyCode == 125 { // ↓
+                        self.expandNextSection()
+                    } else { // ↑
+                        self.collapseLastSection()
+                    }
+                    return nil
+                }
+                return event
+            }
+
             switch event.keyCode {
             case 33: // [
                 self.navigateBack()
@@ -925,6 +1142,20 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             .foregroundColor: NSColor.labelColor
         ]
         definitionsTextView.textStorage?.setAttributedString(NSAttributedString(string: joined, attributes: defAttrs))
+
+        // 构建其他词性 / 近义词 内容并决定初始展开状态
+        relatedWordAttributedContent = buildRelatedWordsAttributedString(data.relatedWordGroups)
+        synonymAttributedContent = buildSynonymsAttributedString(data.synonymGroups)
+
+        relatedWordsExpanded = data.relatedWordGroups.isEmpty ? false : AppConfig.shared.showRelatedWords
+        synonymsExpanded = data.synonymGroups.isEmpty ? false : AppConfig.shared.showSynonyms
+
+        setSectionContent(relatedWordsTextView, attributedContent: relatedWordAttributedContent,
+                          heightConstraint: relatedWordsHeightConstraint,
+                          scrollView: relatedWordsScrollView, expanded: relatedWordsExpanded)
+        setSectionContent(synonymsTextView, attributedContent: synonymAttributedContent,
+                          heightConstraint: synonymsHeightConstraint,
+                          scrollView: synonymsScrollView, expanded: synonymsExpanded)
         
         // 根据释义内容自适应调整窗口高度
         adjustWindowHeightForContent()
@@ -964,17 +1195,144 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                                 DictionaryViewController.maxDefinitionsHeight)
         
         scrollViewHeightConstraint.constant = clampedHeight
-        
-        // 计算窗口目标高度: baseHeightWithoutDefinitions 已包含 scrollView 上下各 20 的间距，
-        // 这里减去上下间距常量中已计入的尾部 20, 再按实际内容追加.
-        let bottomPadding: CGFloat = clampedHeight > 0 ? 20 : 0
-        let contentAreaHeight = DictionaryViewController.baseHeightWithoutDefinitions - 20 + clampedHeight + bottomPadding
-        
+
+        // 计算窗口目标高度: 基础区域 + 释义区 + 其他词性区 + 近义词区
+        let relHeight = relatedWordsScrollView.isHidden ? 0 : (relatedWordsHeightConstraint.constant + 12)
+        let synHeight = synonymsScrollView.isHidden ? 0 : (synonymsHeightConstraint.constant + 12)
+        let bottomPadding: CGFloat = (clampedHeight > 0 || relHeight > 0 || synHeight > 0) ? 20 : 0
+        let contentAreaHeight = DictionaryViewController.baseHeightWithoutDefinitions - 20 + clampedHeight + relHeight + synHeight + bottomPadding
+
         resizeWindowKeepingTop(to: contentAreaHeight)
-        
-        Logger.shared.log("View: 自适应高度 - 文本高度: \(contentHeight), scrollView: \(clampedHeight), 窗口内容区: \(contentAreaHeight)")
+
+        Logger.shared.log("View: 自适应高度 - 释义: \(clampedHeight), 其他词性: \(relHeight), 近义词: \(synHeight), 窗口: \(contentAreaHeight)")
     }
-    
+
+    // MARK: 其他词性 & 近义词
+
+    private func buildRelatedWordsAttributedString(_ groups: [RelatedWordGroup]) -> NSAttributedString? {
+        guard !groups.isEmpty else { return nil }
+        let result = NSMutableAttributedString()
+
+        let headerAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: 12),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        result.append(NSAttributedString(string: "其他词性\n", attributes: headerAttrs))
+
+        for group in groups {
+            let wordStrings = group.words.map { $0.word + ($0.translation.isEmpty ? "" : " \($0.translation)") }
+            let line = "\(group.pos)  " + wordStrings.joined(separator: " · ")
+
+            let lineAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NSColor.labelColor
+            ]
+            let lineAttr = NSMutableAttributedString(string: line + "\n", attributes: lineAttrs)
+
+            for w in group.words {
+                let range = (line as NSString).range(of: w.word)
+                if range.location != NSNotFound {
+                    let linkURL = URL(string: "spell-suggest://\(w.word.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? w.word)")!
+                    lineAttr.addAttribute(.link, value: linkURL, range: range)
+                    lineAttr.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+                }
+            }
+            result.append(lineAttr)
+        }
+        return result
+    }
+
+    private func buildSynonymsAttributedString(_ groups: [SynonymGroup]) -> NSAttributedString? {
+        guard !groups.isEmpty else { return nil }
+        let result = NSMutableAttributedString()
+
+        let headerAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: 12),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        result.append(NSAttributedString(string: "近义词\n", attributes: headerAttrs))
+
+        for group in groups {
+            let transPart = group.translation.isEmpty ? "" : "（\(group.translation)）"
+            let line = "\(group.pos)  " + group.synonyms.joined(separator: " · ") + transPart
+
+            let lineAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NSColor.labelColor
+            ]
+            let lineAttr = NSMutableAttributedString(string: line + "\n", attributes: lineAttrs)
+
+            for syn in group.synonyms {
+                let range = (line as NSString).range(of: syn)
+                if range.location != NSNotFound {
+                    let linkURL = URL(string: "spell-suggest://\(syn.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? syn)")!
+                    lineAttr.addAttribute(.link, value: linkURL, range: range)
+                    lineAttr.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+                }
+            }
+            result.append(lineAttr)
+        }
+        return result
+    }
+
+    private func setSectionContent(_ textView: NSTextView, attributedContent: NSAttributedString?,
+                                    heightConstraint: NSLayoutConstraint, scrollView: NSScrollView,
+                                    expanded: Bool) {
+        guard let content = attributedContent, expanded else {
+            textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
+            scrollView.isHidden = true
+            heightConstraint.constant = 0
+            return
+        }
+        textView.textStorage?.setAttributedString(content)
+        scrollView.isHidden = false
+        refreshSectionHeight(textView: textView, heightConstraint: heightConstraint)
+    }
+
+    private func refreshSectionHeight(textView: NSTextView, heightConstraint: NSLayoutConstraint) {
+        guard let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer else { return }
+        layoutManager.ensureLayout(for: textContainer)
+        let h = ceil(layoutManager.usedRect(for: textContainer).height)
+        heightConstraint.constant = h
+    }
+
+    /// 展开下一个折叠的 section, 若没有可展开的则忽略.
+    func expandNextSection() {
+        if relatedWordAttributedContent != nil && !relatedWordsExpanded {
+            toggleRelatedWordsSection()
+        } else if synonymAttributedContent != nil && !synonymsExpanded {
+            toggleSynonymsSection()
+        }
+    }
+
+    /// 收缩上一个展开的 section, 若没有可收缩的则忽略.
+    func collapseLastSection() {
+        if synonymAttributedContent != nil && synonymsExpanded {
+            toggleSynonymsSection()
+        } else if relatedWordAttributedContent != nil && relatedWordsExpanded {
+            toggleRelatedWordsSection()
+        }
+    }
+
+    private func toggleRelatedWordsSection() {
+        relatedWordsExpanded.toggle()
+        setSectionContent(relatedWordsTextView, attributedContent: relatedWordAttributedContent,
+                          heightConstraint: relatedWordsHeightConstraint,
+                          scrollView: relatedWordsScrollView, expanded: relatedWordsExpanded)
+        adjustWindowHeightForContent()
+        cancelFadeOut()
+    }
+
+    private func toggleSynonymsSection() {
+        synonymsExpanded.toggle()
+        setSectionContent(synonymsTextView, attributedContent: synonymAttributedContent,
+                          heightConstraint: synonymsHeightConstraint,
+                          scrollView: synonymsScrollView, expanded: synonymsExpanded)
+        adjustWindowHeightForContent()
+        cancelFadeOut()
+    }
+
     // MARK: 查询完成后 10 秒淡出
     
     /// (重新) 启动淡出: alpha 1.0 -> 0.0 over `fadeOutTotalDuration`, 末尾 orderOut
@@ -1234,6 +1592,18 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         playButton.isHidden = true
         definitionsTextView.string = ""
         scrollViewHeightConstraint.constant = 0
+
+        relatedWordAttributedContent = nil
+        synonymAttributedContent = nil
+        relatedWordsExpanded = false
+        synonymsExpanded = false
+        setSectionContent(relatedWordsTextView, attributedContent: nil,
+                          heightConstraint: relatedWordsHeightConstraint,
+                          scrollView: relatedWordsScrollView, expanded: false)
+        setSectionContent(synonymsTextView, attributedContent: nil,
+                          heightConstraint: synonymsHeightConstraint,
+                          scrollView: synonymsScrollView, expanded: false)
+
         resizeWindowKeepingTop(to: DictionaryViewController.initialHeight)
     }
 }
@@ -1651,6 +2021,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let fadeCheckbox = NSButton(checkboxWithTitle: "查询完成后自动淡出窗口", target: nil, action: nil)
         fadeCheckbox.state = AppConfig.shared.fadeOutEnabled ? .on : .off
 
+        let relCheckbox = NSButton(checkboxWithTitle: "显示其他词性（动词、名词、副词等）", target: nil, action: nil)
+        relCheckbox.state = AppConfig.shared.showRelatedWords ? .on : .off
+
+        let synCheckbox = NSButton(checkboxWithTitle: "显示近义词", target: nil, action: nil)
+        synCheckbox.state = AppConfig.shared.showSynonyms ? .on : .off
+
         // --- 数据库 ---
         let dbSectionLabel = makeSectionHeader("数据库")
         let dbInfoRight = "\(wordCount) 条 · \(AppPaths.formatFileSize(dbSize))"
@@ -1686,7 +2062,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         contentStack.addArrangedSubview(basicLabel)
         contentStack.addArrangedSubview(fadeCheckbox)
-        contentStack.setCustomSpacing(sectionSpacing, after: fadeCheckbox)
+        contentStack.addArrangedSubview(relCheckbox)
+        contentStack.addArrangedSubview(synCheckbox)
+        contentStack.setCustomSpacing(sectionSpacing, after: synCheckbox)
 
         let sep1 = makeSeparator()
         contentStack.addArrangedSubview(sep1)
@@ -1745,7 +2123,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Modal 结束后 (面板已关闭) 保存配置
         let newEnabled = (fadeCheckbox.state == .on)
         let oldEnabled = AppConfig.shared.fadeOutEnabled
+        let newRelEnabled = (relCheckbox.state == .on)
+        let newSynEnabled = (synCheckbox.state == .on)
         AppConfig.shared.fadeOutEnabled = newEnabled
+        AppConfig.shared.showRelatedWords = newRelEnabled
+        AppConfig.shared.showSynonyms = newSynEnabled
 
         if !newEnabled {
             if let vc = self.window.contentViewController as? DictionaryViewController {

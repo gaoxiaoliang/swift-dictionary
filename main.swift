@@ -27,34 +27,9 @@ enum AppPaths {
 
     static let databaseURL: URL = appSupportDir.appendingPathComponent("dictionary.db")
 
-    private static let fm = FileManager.default
-
-    /// 旧版目录 (v1.x 使用 "swift-dict")，用于迁移数据和后续清理
-    private static let legacyAppSupportDir: URL = {
-        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return base.appendingPathComponent("swift-dict", isDirectory: true)
-    }()
-
-    private static let legacyLogsDir: URL = {
-        fm.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/swift-dict", isDirectory: true)
-    }()
-
     static func ensureDirectoriesExist() {
-        let legacyDB = legacyAppSupportDir.appendingPathComponent("dictionary.db")
-
-        // 迁移旧数据库: 移动 > 删除旧目录
-        if fm.fileExists(atPath: legacyDB.path), !fm.fileExists(atPath: databaseURL.path) {
-            try? fm.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
-            if let _ = try? fm.moveItem(at: legacyDB, to: databaseURL) {
-                // 迁移成功，清理旧目录 (尽力而为)
-                try? fm.removeItem(at: legacyAppSupportDir)
-                try? fm.removeItem(at: legacyLogsDir)
-            }
-        }
-
-        try? fm.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
-        try? fm.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
     }
 
     /// 数据库文件大小 (字节), 文件不存在返回 nil
@@ -120,17 +95,6 @@ class AppConfig {
         defaults.register(defaults: [
             Keys.fadeOutEnabled: true
         ])
-        migrateFromLegacyBundleIfNeeded()
-    }
-
-    /// 从旧版 bundle ID (com.xiaoliang.swift-dict) 迁移 UserDefaults 配置
-    private func migrateFromLegacyBundleIfNeeded() {
-        let legacySuite = "com.xiaoliang.swift-dict"
-        guard let legacy = UserDefaults(suiteName: legacySuite),
-              legacy.object(forKey: Keys.fadeOutEnabled) != nil else { return }
-        let oldValue = legacy.bool(forKey: Keys.fadeOutEnabled)
-        defaults.set(oldValue, forKey: Keys.fadeOutEnabled)
-        legacy.removePersistentDomain(forName: legacySuite)
     }
 
     var fadeOutEnabled: Bool {

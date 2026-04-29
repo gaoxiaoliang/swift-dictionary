@@ -7,6 +7,7 @@
 #   make app        -> build SwiftDict.app bundle in build/
 #   make dmg        -> build DMG installer at dist/SwiftDict-<version>.dmg
 #   make run        -> build debug + run the binary
+#   make install    -> build .app, replace /Applications/SwiftDict.app, relaunch
 #   make clean      -> remove all build artifacts
 
 SWIFTC        := swiftc
@@ -32,7 +33,7 @@ COMMON_FLAGS  := $(LIBS)
 DEBUG_FLAGS   := -D DEBUG -g -Onone
 RELEASE_FLAGS := -O
 
-.PHONY: all debug release app dmg run clean sign BuildInfo.swift
+.PHONY: all debug release app dmg run clean install sign BuildInfo.swift
 
 all: debug
 
@@ -93,6 +94,17 @@ dmg: app
 	@mkdir -p $(DIST_DIR)
 	@./scripts/make-dmg.sh $(APP_BUNDLE) $(DMG_PATH) $(VOL_NAME)
 	@echo "==> DMG ready: $(DMG_PATH)"
+
+# ----------------------------------------------------------------------------
+# Install to /Applications
+# ----------------------------------------------------------------------------
+install: app
+	@echo "==> Installing to /Applications/$(APP_NAME).app"
+	@pkill -x $(APP_NAME) 2>/dev/null || true
+	@rm -rf "/Applications/$(APP_NAME).app"
+	@cp -R $(APP_BUNDLE) "/Applications/"
+	@open "/Applications/$(APP_NAME).app"
+	@echo "==> Installed and launched"
 
 # ----------------------------------------------------------------------------
 # Cleanup

@@ -784,8 +784,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         let trimmed = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let word = trimmed.lowercased()
-        addToHistory(word)
-        performQuery(for: word)
+        performQuery(for: word, recordInHistory: true)
     }
 
     private func addToHistory(_ word: String) {
@@ -828,7 +827,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         displayHistoryWord(next)
     }
 
-    private func performQuery(for word: String) {
+    private func performQuery(for word: String, recordInHistory: Bool = true) {
         Logger.shared.log("View: 查询单词 '\(word)'")
         cancelFadeOut()
         displayedWord = searchField.stringValue
@@ -840,6 +839,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                 self.showLoading(false)
                 switch result {
                 case .success(let data):
+                    if recordInHistory {
+                        self.addToHistory(word)
+                    }
                     self.displayResult(data, word: word)
                 case .failure(let error):
                     self.handleQueryError(error, forWord: word)
@@ -855,7 +857,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             editor.selectedRange = NSRange(location: word.count, length: 0)
         }
         isNavigating = false
-        performQuery(for: word)
+        performQuery(for: word, recordInHistory: false)
     }
 
     private func installHistoryNavigationMonitor() {

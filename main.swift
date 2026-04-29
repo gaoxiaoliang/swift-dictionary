@@ -95,7 +95,7 @@ class AppConfig {
 
     init() {
         defaults.register(defaults: [
-            Keys.fadeOutEnabled: true,
+            Keys.fadeOutEnabled: false,
             Keys.showRelatedWords: false,
             Keys.showSynonyms: false
         ])

@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive build metadata
+        id: meta
+        run: |
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_TIME=$(date "+%Y-%m-%d %H:%M:%S %z")
+          VERSION=$(git describe --tags --always --dirty)
+          echo "commit=${COMMIT}" >> $GITHUB_OUTPUT
+          echo "build_time=${BUILD_TIME}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Generate BuildInfo.swift
+        run: |
+          sed -e 's|@COMMIT@|${{ steps.meta.outputs.commit }}|g' \
+              -e 's|@BUILD_TIME@|${{ steps.meta.outputs.build_time }}|g' \
+              -e 's|@VERSION@|${{ steps.meta.outputs.version }}|g' \
+              BuildInfo.swift.in > BuildInfo.swift
+
+      - name: Build for x86_64
+        run: |
+          swiftc -o SwiftDict-x86_64 main.swift BuildInfo.swift \
+            -lsqlite3 -O \
+            -target x86_64-apple-macosx12.0
+
+      - name: Build for arm64
+        run: |
+          swiftc -o SwiftDict-arm64 main.swift BuildInfo.swift \
+            -lsqlite3 -O \
+            -target arm64-apple-macosx12.0
+
+      - name: Create universal binary
+        run: |
+          lipo -create -output SwiftDict SwiftDict-x86_64 SwiftDict-arm64
+          rm SwiftDict-x86_64 SwiftDict-arm64
+
+      - name: Create app bundle
+        run: |
+          APP_BUNDLE="build/SwiftDict.app"
+          mkdir -p "$APP_BUNDLE/Contents/MacOS"
+          mkdir -p "$APP_BUNDLE/Contents/Resources"
+
+          cp SwiftDict "$APP_BUNDLE/Contents/MacOS/SwiftDict"
+
+          sed -e 's|@VERSION@|${{ steps.meta.outputs.version }}|g' \
+              Resources/Info.plist.in > "$APP_BUNDLE/Contents/Info.plist"
+
+          if [ -f Resources/AppIcon.icns ]; then
+            cp Resources/AppIcon.icns "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+            /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" \
+              "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || true
+          fi
+
+          codesign --force --deep --sign - "$APP_BUNDLE"
+
+      - name: Create DMG
+        run: |
+          APP_BUNDLE="build/SwiftDict.app"
+          DMG_PATH="dist/SwiftDict-${{ steps.meta.outputs.version }}.dmg"
+          mkdir -p dist
+
+          STAGE_DIR="$(mktemp -d /tmp/swift-dict-dmg.XXXXXX)"
+          cp -R "$APP_BUNDLE" "$STAGE_DIR/"
+          ln -s /Applications "$STAGE_DIR/Applications"
+
+          hdiutil create \
+            -volname "SwiftDict" \
+            -srcfolder "$STAGE_DIR" \
+            -ov \
+            -format UDZO \
+            -fs HFS+ \
+            "$DMG_PATH"
+
+          rm -rf "$STAGE_DIR"
+
+      - name: Upload DMG to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/SwiftDict-*.dmg
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

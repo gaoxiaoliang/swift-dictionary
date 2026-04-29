@@ -78,4 +78,4 @@ make install    # 构建 .app 并替换 /Applications/SwiftDict.app
 
 ## License
 
-MIT
+SwiftDict 基于 MIT License 发布，详见 [LICENSE](./LICENSE)。

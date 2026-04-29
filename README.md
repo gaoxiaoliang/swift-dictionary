@@ -2,8 +2,6 @@
 
 A minimalist macOS English-Chinese dictionary app born from pure vibe coding — it lives in your menu bar, summons with a single keystroke, and gets out of your way the moment you're done.
 
-[中文说明 →](README_CN.md)
-
 ## Why
 
 I wanted a dictionary that imposes zero friction. No Dock icon, no window hunting, no extra clicks. Press a key, look up a word, done. SwiftDict is that tool, built for myself and shared as open source.
@@ -78,4 +76,4 @@ Requires macOS 12+, Swift 5.7+, no third-party dependencies.
 
 ## License
 
-MIT
+SwiftDict is released under MIT License. See [LICENSE](./LICENSE) for details.

@@ -827,6 +827,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         // 查询成功, 启动 10 秒淡出倒计时
         startFadeOutCountdown()
         
+        // 构造音频 URL, 无论走缓存或网络都设为当前单词 (供喇叭按钮重播使用)
+        currentAudioURL = URL(string: "https://dict.youdao.com/speech?word=\(word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word)&type=1")
+
         if let cachedData = data.cachedAudioData {
             Logger.shared.log("View: 使用缓存音频 \(cachedData.count) bytes")
             do {
@@ -837,7 +840,6 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                 Logger.shared.error("View: 播放缓存音频失败", error: error)
             }
         } else if data.ukspeech != nil {
-            currentAudioURL = URL(string: "https://dict.youdao.com/speech?word=\(word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word)&type=1")
             Logger.shared.log("View: 准备播放发音")
             playAudioAction()
         }

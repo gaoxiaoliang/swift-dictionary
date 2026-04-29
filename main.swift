@@ -524,6 +524,12 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     
     private var pasteMonitor: Any?
     private var escMonitor: Any?
+    private var historyNavMonitor: Any?
+
+    private var wordHistory: [String] = []
+    private var historyIndex: Int = -1
+    private let maxHistorySize = 100
+    private var isNavigating = false
     
     // 淡出相关
     private var fadeOutTimer: Timer?
@@ -665,15 +671,13 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         
         installPasteMonitor()
         installEscMonitor()
+        installHistoryNavigationMonitor()
     }
     
     deinit {
-        if let monitor = pasteMonitor {
-            NSEvent.removeMonitor(monitor)
-        }
-        if let monitor = escMonitor {
-            NSEvent.removeMonitor(monitor)
-        }
+        if let monitor = pasteMonitor { NSEvent.removeMonitor(monitor) }
+        if let monitor = escMonitor { NSEvent.removeMonitor(monitor) }
+        if let monitor = historyNavMonitor { NSEvent.removeMonitor(monitor) }
     }
     
     /// 安装 Cmd+V 局部事件监听器: 搜索框获得焦点时, 读剪贴板 -> 清洗 -> 自动查询.
@@ -776,17 +780,32 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     }
     
     @objc func searchWordAction() {
-        let word = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !word.isEmpty else { return }
-        
+        let trimmed = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let word = trimmed.lowercased()
+        addToHistory(word)
+        performQuery(for: word)
+    }
+
+    private func addToHistory(_ word: String) {
+        if historyIndex >= 0, historyIndex < wordHistory.count - 1 {
+            wordHistory = Array(wordHistory.prefix(historyIndex + 1))
+        }
+        if wordHistory.isEmpty || wordHistory.last != word {
+            wordHistory.append(word)
+            if wordHistory.count > maxHistorySize {
+                wordHistory.removeFirst()
+            }
+        }
+        historyIndex = wordHistory.count - 1
+    }
+
+    private func performQuery(for word: String) {
         Logger.shared.log("View: 查询单词 '\(word)'")
-        // 查询开始, 取消任何进行中的淡出 (窗口保持完全可见, 等查询返回再重新计时)
         cancelFadeOut()
-        // 记录本次查询实际提交到输入框里的原始字符串, 供 controlTextDidChange 识别
-        // "用户是否在已有结果后继续键入" 以便触发覆盖逻辑.
         displayedWord = searchField.stringValue
         showLoading(true)
-        
+
         YoudaoAPI.shared.query(word: word) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
@@ -797,6 +816,51 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                 case .failure(let error):
                     self.handleQueryError(error, forWord: word)
                 }
+            }
+        }
+    }
+
+    private func navigateBack() {
+        guard historyIndex > 0 else { return }
+        historyIndex -= 1
+        displayHistoryWord(wordHistory[historyIndex])
+    }
+
+    private func navigateForward() {
+        guard historyIndex < wordHistory.count - 1 else { return }
+        historyIndex += 1
+        displayHistoryWord(wordHistory[historyIndex])
+    }
+
+    private func displayHistoryWord(_ word: String) {
+        isNavigating = true
+        searchField.stringValue = word
+        if let editor = searchField.currentEditor() {
+            editor.selectedRange = NSRange(location: word.count, length: 0)
+        }
+        isNavigating = false
+        performQuery(for: word)
+    }
+
+    private func installHistoryNavigationMonitor() {
+        historyNavMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self,
+                  let window = self.view.window,
+                  window.isKeyWindow else { return event }
+            guard !event.modifierFlags.contains(.command),
+                  !event.modifierFlags.contains(.option),
+                  !event.modifierFlags.contains(.shift),
+                  !event.modifierFlags.contains(.control) else { return event }
+
+            switch event.keyCode {
+            case 33: // [
+                self.navigateBack()
+                return nil
+            case 30: // ]
+                self.navigateForward()
+                return nil
+            default:
+                return event
             }
         }
     }
@@ -1119,7 +1183,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     }
     
     func controlTextDidChange(_ notification: Notification) {
-        guard hasSearched else { return }
+        guard hasSearched, !isNavigating else { return }
         
         let current = searchField.stringValue
         

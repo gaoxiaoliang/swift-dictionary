@@ -16,14 +16,19 @@ I wanted a dictionary that imposes zero friction. No Dock icon, no window huntin
 | **Cmd+V** | Search field focused | Paste clipboard, clean it, look up |
 | **`[`** | Window focused | Go back in query history |
 | **`]`** | Window focused | Go forward in query history |
-| **`↓`** | Search field focused | Expand next result section |
-| **`↑`** | Search field focused | Collapse last result section |
+| **`↓`** | Search field focused | Expand next result section (navigate suggestions if visible) |
+| **`↑`** | Search field focused | Collapse last result section (navigate suggestions if visible) |
 | **Esc** | Window focused | Hide dictionary window (returns focus to previous app) |
 | **Ctrl+A/E/B/F** | Search field focused | Move cursor, enter edit mode (append instead of replace) |
+| **Tab** | Suggestions visible | Accept first suggestion |
+| **`↓`/`↑`** | Suggestions visible | Select suggestion, Enter to accept |
 
-### Smart Typing
+### Search Suggestions
 
-After looking up a word, typing new characters **replaces** the word by default — handy for quickly searching something new. Press `Ctrl+A`, `Ctrl+E`, `Ctrl+B`, or `Ctrl+F` to enter **edit mode**, where typing appends to the current word instead.
+As you type, matching words from your lookup history appear in a dropdown. Sorted by length then alphabetically, with the first item highlighted by default:
+- **Tab** immediately accepts the first suggestion
+- **`↓`/`↑`** navigates the list, **Enter** accepts the selected word
+- **Esc** hides suggestions first, then hides the window on second press
 
 ## Features
 
@@ -31,6 +36,7 @@ After looking up a word, typing new characters **replaces** the word by default 
 - **Focus toggle** — Right Option toggles keyboard focus between the search field and your previous app, letting you hop back and forth without hiding the window.
 - **Paste-and-search** — `Cmd+V` with the search field focused auto-cleans clipboard text and looks it up. Works with `"don't"`, `"self-made"`, and multi-word phrases.
 - **Cached offline** — Lookups hit a local SQLite database first. Previously seen words load instantly with zero network.
+- **Search suggestions** — Prefix-matched suggestions from your lookup history appear as you type. Tab to accept, arrow keys to navigate.
 - **Audio pronunciation** — Auto-plays British pronunciation on each lookup. Click the speaker icon to replay.
 - **Word history** — `[` and `]` navigate your recent queries like a browser's back/forward. Up to 100 entries.
 - **Related words & synonyms** — Optional sections below definitions showing other POS forms and synonyms (toggle in settings or with `↓`/`↑`).

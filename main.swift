@@ -770,8 +770,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         suggestionsScrollView.drawsBackground = false
         suggestionsScrollView.isHidden = true
         suggestionsScrollView.wantsLayer = true
-        suggestionsScrollView.layer?.cornerRadius = 6
-        suggestionsScrollView.layer?.borderWidth = 1
+        suggestionsScrollView.layer?.borderWidth = 0.5
         suggestionsScrollView.layer?.borderColor = NSColor.separatorColor.cgColor
         
         suggestionsTableView = NSTableView()
@@ -779,8 +778,8 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         suggestionsTableView.headerView = nil
         suggestionsTableView.selectionHighlightStyle = .regular
         suggestionsTableView.intercellSpacing = NSSize(width: 0, height: 0)
-        suggestionsTableView.rowHeight = 28
-        suggestionsTableView.backgroundColor = .controlBackgroundColor
+        suggestionsTableView.rowHeight = 30
+        suggestionsTableView.backgroundColor = .textBackgroundColor
         suggestionsTableView.delegate = self
         suggestionsTableView.dataSource = self
         suggestionsTableView.target = self
@@ -791,11 +790,6 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         column.width = suggestionColWidth
         column.minWidth = suggestionColWidth
         column.maxWidth = suggestionColWidth
-        if let cell = column.dataCell as? NSTextFieldCell {
-            cell.font = NSFont.systemFont(ofSize: 14)
-            cell.textColor = .labelColor
-            cell.drawsBackground = false
-        }
         suggestionsTableView.addTableColumn(column)
         suggestionsScrollView.documentView = suggestionsTableView
         view.addSubview(suggestionsScrollView)
@@ -919,7 +913,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             searchButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
             searchButton.widthAnchor.constraint(equalToConstant: 80),
             
-            suggestionsScrollView.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 2),
+            suggestionsScrollView.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 0),
             suggestionsScrollView.leadingAnchor.constraint(equalTo: searchField.leadingAnchor),
             suggestionsScrollView.trailingAnchor.constraint(equalTo: searchField.trailingAnchor),
             
@@ -1803,12 +1797,16 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         refreshSuggestionHighlight()
         suggestionsScrollView.isHidden = false
         
-        let rowH = suggestionsTableView.rowHeight + suggestionsTableView.intercellSpacing.height
-        let visibleRows = min(5, words.count)
-        let tableHeight = CGFloat(visibleRows) * rowH
-        suggestionsHeightConstraint.constant = tableHeight + 4  // +4 补偿 border/cornerRadius
+        // 精确计算内容高度 (使用 table view 自身布局, 避免手动估算误差)
+        let maxVisible = min(5, words.count)
+        var contentHeight: CGFloat = 0
+        if maxVisible > 0 {
+            contentHeight = suggestionsTableView.rect(ofRow: maxVisible - 1).maxY
+        }
+        suggestionsScrollView.hasVerticalScroller = words.count > 5
+        suggestionsHeightConstraint.constant = contentHeight
         
-        let newHeight = DictionaryViewController.initialHeight + tableHeight + 6  // gap(2) + border(4)
+        let newHeight = DictionaryViewController.initialHeight + contentHeight
         resizeWindowKeepingTop(to: newHeight)
     }
     
@@ -1830,11 +1828,11 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         searchWordAction()
     }
     
-    /// 刷新建议列表行高亮, 使伪选中行显示浅色背景.
+    /// 刷新建议列表行高亮, 伪选中行显示浅灰底色, 真选中使用系统高亮.
     private func refreshSuggestionHighlight() {
         suggestionsTableView.enumerateAvailableRowViews { rowView, row in
             if suggestionState == .pseudoSelected && row == 0 {
-                rowView.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.12)
+                rowView.backgroundColor = NSColor.quaternaryLabelColor
             } else {
                 rowView.backgroundColor = .clear
             }
@@ -1853,8 +1851,34 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         return suggestions.count
     }
     
-    func tableView(_ tableView: NSTableView, objectValueFor tableColumn: NSTableColumn?, row: Int) -> Any? {
-        return suggestions[row]
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let id = NSUserInterfaceItemIdentifier("SuggestionCell")
+        if let wrapper = tableView.makeView(withIdentifier: id, owner: nil),
+           let label = wrapper.subviews.first as? NSTextField {
+            label.stringValue = suggestions[row]
+            return wrapper
+        }
+        let wrapper = NSView(frame: NSRect(x: 0, y: 0, width: 100, height: tableView.rowHeight))
+        wrapper.identifier = id
+        
+        let label = NSTextField()
+        label.isEditable = false
+        label.isBordered = false
+        label.drawsBackground = false
+        label.backgroundColor = .clear
+        label.font = NSFont.systemFont(ofSize: 14)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.cell?.truncatesLastVisibleLine = true
+        label.stringValue = suggestions[row]
+        label.translatesAutoresizingMaskIntoConstraints = false
+        wrapper.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor, constant: 3),
+            label.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor, constant: -6),
+            label.centerYAnchor.constraint(equalTo: wrapper.centerYAnchor),
+        ])
+        return wrapper
     }
     
     // MARK: NSTableViewDelegate

@@ -306,6 +306,25 @@ class Database {
             Logger.shared.log("DB: 已保存 - \(word)")
         }
     }
+    
+    /// 前缀匹配查询缓存单词, 按长度升序、同长度字典序排列, 最多返回 limit 条.
+    func queryWordsByPrefix(_ prefix: String, limit: Int = 20) -> [String] {
+        guard let db = db else { return [] }
+        let sql = "SELECT word FROM words WHERE word LIKE ? ORDER BY LENGTH(word), word LIMIT ?"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        let pattern = "\(prefix.lowercased())%"
+        sqlite3_bind_text(stmt, 1, pattern, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(stmt, 2, Int32(limit))
+        var results: [String] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let cStr = sqlite3_column_text(stmt, 0) {
+                results.append(String(cString: cStr))
+            }
+        }
+        return results
+    }
 }
 
 // MARK: - Logger
@@ -633,7 +652,7 @@ class YoudaoAPI {
 
 // MARK: - Dictionary View Controller
 
-class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextViewDelegate {
+class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextViewDelegate, NSTableViewDelegate, NSTableViewDataSource {
     var searchField: NSTextField!
     var wordLabel: NSTextField!
     var phoneticLabel: NSTextField!
@@ -652,6 +671,20 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     /// 用户是否通过 Control+A/E/B/F 等光标移动键显式进入了编辑模式.
     /// 进入编辑模式后, 在末尾键入不再覆盖原词, 而是正常追加.
     private var userEditingWord: Bool = false
+    /// 防止 controlTextDidChange 中因替换逻辑导致的重入
+    private var isProcessingTextChange: Bool = false
+    
+    // 搜索建议
+    private enum SuggestionState {
+        case hidden
+        case pseudoSelected   // 首行高亮但未实际选中
+        case trulySelected    // 用户通过方向键/点击真正选中了某行
+    }
+    private var suggestions: [String] = []
+    private var suggestionState: SuggestionState = .hidden
+    private var suggestionsScrollView: NSScrollView!
+    private var suggestionsTableView: NSTableView!
+    private var suggestionsHeightConstraint: NSLayoutConstraint!
     
     private var pasteMonitor: Any?
     private var escMonitor: Any?
@@ -727,6 +760,45 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         let searchButton = NSButton(title: "查询", target: self, action: #selector(searchWordAction))
         searchButton.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(searchButton)
+        
+        // 搜索建议列表 (前缀匹配下拉)
+        suggestionsScrollView = NSScrollView()
+        suggestionsScrollView.translatesAutoresizingMaskIntoConstraints = false
+        suggestionsScrollView.hasVerticalScroller = true
+        suggestionsScrollView.autohidesScrollers = true
+        suggestionsScrollView.borderType = .noBorder
+        suggestionsScrollView.drawsBackground = false
+        suggestionsScrollView.isHidden = true
+        suggestionsScrollView.wantsLayer = true
+        suggestionsScrollView.layer?.cornerRadius = 6
+        suggestionsScrollView.layer?.borderWidth = 1
+        suggestionsScrollView.layer?.borderColor = NSColor.separatorColor.cgColor
+        
+        suggestionsTableView = NSTableView()
+        suggestionsTableView.translatesAutoresizingMaskIntoConstraints = false
+        suggestionsTableView.headerView = nil
+        suggestionsTableView.selectionHighlightStyle = .regular
+        suggestionsTableView.intercellSpacing = NSSize(width: 0, height: 0)
+        suggestionsTableView.rowHeight = 28
+        suggestionsTableView.backgroundColor = .controlBackgroundColor
+        suggestionsTableView.delegate = self
+        suggestionsTableView.dataSource = self
+        suggestionsTableView.target = self
+        suggestionsTableView.action = #selector(suggestionClicked(_:))
+        
+        let suggestionColWidth = DictionaryViewController.contentWidth - DictionaryViewController.horizontalPadding * 2 - 10 - 80
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("word"))
+        column.width = suggestionColWidth
+        column.minWidth = suggestionColWidth
+        column.maxWidth = suggestionColWidth
+        if let cell = column.dataCell as? NSTextFieldCell {
+            cell.font = NSFont.systemFont(ofSize: 14)
+            cell.textColor = .labelColor
+            cell.drawsBackground = false
+        }
+        suggestionsTableView.addTableColumn(column)
+        suggestionsScrollView.documentView = suggestionsTableView
+        view.addSubview(suggestionsScrollView)
         
         wordLabel = NSTextField(labelWithString: "")
         wordLabel.font = NSFont.boldSystemFont(ofSize: 32)
@@ -847,6 +919,10 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             searchButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
             searchButton.widthAnchor.constraint(equalToConstant: 80),
             
+            suggestionsScrollView.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 2),
+            suggestionsScrollView.leadingAnchor.constraint(equalTo: searchField.leadingAnchor),
+            suggestionsScrollView.trailingAnchor.constraint(equalTo: searchField.trailingAnchor),
+            
             wordLabel.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 20),
             wordLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
             
@@ -882,6 +958,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
 
         synonymsHeightConstraint = synonymsScrollView.heightAnchor.constraint(equalToConstant: 0)
         synonymsHeightConstraint.isActive = true
+        
+        suggestionsHeightConstraint = suggestionsScrollView.heightAnchor.constraint(equalToConstant: 0)
+        suggestionsHeightConstraint.isActive = true
         
         installPasteMonitor()
         installEscMonitor()
@@ -925,13 +1004,23 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         }
     }
     
-    /// Esc 键隐藏主窗口 (仅在窗口为 key window 时生效, 不干扰 About/Config 面板)
+    /// Esc 键: 若建议列表可见则先隐藏建议, 否则隐藏主窗口.
+    /// 仅在窗口为 key window 时生效, 不干扰 About/Config 面板.
     private func installEscMonitor() {
         escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == 53,
                   let self = self,
                   let window = self.view.window,
                   window.isKeyWindow else { return event }
+            
+            if self.suggestionState != .hidden {
+                Logger.shared.log("View: Esc 隐藏建议列表")
+                DispatchQueue.main.async {
+                    self.hideSuggestions()
+                }
+                return nil
+            }
+            
             Logger.shared.log("View: Esc 隐藏窗口")
             DispatchQueue.main.async {
                 if let appDelegate = NSApp.delegate as? AppDelegate {
@@ -1086,7 +1175,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                   !event.modifierFlags.contains(.shift),
                   !event.modifierFlags.contains(.control) else { return event }
 
-            // 上下方向键: 仅搜索框聚焦时展开/收缩 section
+            // 上下方向键: 若搜索建议可见则导航建议, 否则展开/收缩 section
             if event.keyCode == 125 || event.keyCode == 126 {
                 let searchFocused: Bool = {
                     guard let responder = window.firstResponder else { return false }
@@ -1094,15 +1183,41 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                     if let editor = self.searchField.currentEditor(), responder === editor { return true }
                     return false
                 }()
-                if searchFocused {
+                guard searchFocused else { return event }
+                
+                if self.suggestionState != .hidden {
                     if event.keyCode == 125 { // ↓
-                        self.expandNextSection()
+                        let currentRow = self.suggestionsTableView.selectedRow
+                        if currentRow < 0 {
+                            self.suggestionsTableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+                            self.suggestionState = .trulySelected
+                            self.refreshSuggestionHighlight()
+                        } else if currentRow + 1 < self.suggestions.count {
+                            self.suggestionsTableView.selectRowIndexes(IndexSet(integer: currentRow + 1), byExtendingSelection: false)
+                        }
+                        self.suggestionsTableView.scrollRowToVisible(self.suggestionsTableView.selectedRow)
                     } else { // ↑
-                        self.collapseLastSection()
+                        let currentRow = self.suggestionsTableView.selectedRow
+                        if currentRow > 0 {
+                            self.suggestionsTableView.selectRowIndexes(IndexSet(integer: currentRow - 1), byExtendingSelection: false)
+                        } else if currentRow == 0 {
+                            self.suggestionsTableView.deselectAll(nil)
+                            self.suggestionState = .pseudoSelected
+                            self.refreshSuggestionHighlight()
+                        }
+                        if self.suggestionsTableView.selectedRow >= 0 {
+                            self.suggestionsTableView.scrollRowToVisible(self.suggestionsTableView.selectedRow)
+                        }
                     }
                     return nil
                 }
-                return event
+                
+                if event.keyCode == 125 { // ↓
+                    self.expandNextSection()
+                } else { // ↑
+                    self.collapseLastSection()
+                }
+                return nil
             }
 
             switch event.keyCode {
@@ -1591,33 +1706,50 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         if commandSelector == #selector(insertNewline(_:)) {
+            if suggestionState == .trulySelected, suggestionsTableView.selectedRow >= 0 {
+                acceptSuggestion(suggestions[suggestionsTableView.selectedRow])
+                return true
+            }
+            hideSuggestions()
             searchWordAction()
             return true
+        }
+        if commandSelector == #selector(insertTab(_:)) {
+            if suggestionState != .hidden, !suggestions.isEmpty {
+                acceptSuggestion(suggestions[0])
+                return true
+            }
         }
         return false
     }
     
     func controlTextDidChange(_ notification: Notification) {
-        guard hasSearched, !isNavigating else { return }
+        guard !isProcessingTextChange, !isNavigating else { return }
         
-        let current = searchField.stringValue
-        
-        // 用户在末尾追加字符 → 默认视为新一次输入, 覆盖原词.
-        // 若用户先按了 Control+A/E/B/F 进入编辑模式, 则跳过覆盖, 允许在原词上追加.
-        if !userEditingWord,
-           !displayedWord.isEmpty,
-           current.count > displayedWord.count,
-           current.hasPrefix(displayedWord) {
-            let appended = String(current.dropFirst(displayedWord.count))
-            Logger.shared.log("View: 已有结果后键入新字符, 覆盖原词 '\(displayedWord)' -> '\(appended)'")
-            searchField.stringValue = appended
-            if let editor = searchField.currentEditor() {
-                let end = appended.count
-                editor.selectedRange = NSRange(location: end, length: 0)
+        if hasSearched {
+            let current = searchField.stringValue
+            
+            // 用户在末尾追加字符 → 默认视为新一次输入, 覆盖原词.
+            // 若用户先按了 Control+A/E/B/F 进入编辑模式, 则跳过覆盖, 允许在原词上追加.
+            if !userEditingWord,
+               !displayedWord.isEmpty,
+               current.count > displayedWord.count,
+               current.hasPrefix(displayedWord) {
+                let appended = String(current.dropFirst(displayedWord.count))
+                Logger.shared.log("View: 已有结果后键入新字符, 覆盖原词 '\(displayedWord)' -> '\(appended)'")
+                isProcessingTextChange = true
+                searchField.stringValue = appended
+                if let editor = searchField.currentEditor() {
+                    let end = appended.count
+                    editor.selectedRange = NSRange(location: end, length: 0)
+                }
+                isProcessingTextChange = false
             }
+            
+            hideResultArea()
         }
         
-        hideResultArea()
+        queryAndShowSuggestions()
     }
     
     /// 隐藏结果展示区 (不触碰 searchField 内容), 并把窗口收回到仅搜索框的高度.
@@ -1645,6 +1777,93 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                           scrollView: synonymsScrollView, expanded: false)
 
         resizeWindowKeepingTop(to: DictionaryViewController.initialHeight)
+    }
+    
+    // MARK: 搜索建议
+    
+    private func queryAndShowSuggestions() {
+        let text = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !text.isEmpty else {
+            hideSuggestions()
+            return
+        }
+        let matches = Database.shared.queryWordsByPrefix(text, limit: 20)
+        if matches.isEmpty {
+            hideSuggestions()
+        } else {
+            showSuggestions(matches)
+        }
+    }
+    
+    private func showSuggestions(_ words: [String]) {
+        suggestions = words
+        suggestionState = .pseudoSelected
+        suggestionsTableView.deselectAll(nil)
+        suggestionsTableView.reloadData()
+        refreshSuggestionHighlight()
+        suggestionsScrollView.isHidden = false
+        
+        let rowH = suggestionsTableView.rowHeight + suggestionsTableView.intercellSpacing.height
+        let visibleRows = min(5, words.count)
+        let tableHeight = CGFloat(visibleRows) * rowH
+        suggestionsHeightConstraint.constant = tableHeight + 4  // +4 补偿 border/cornerRadius
+        
+        let newHeight = DictionaryViewController.initialHeight + tableHeight + 6  // gap(2) + border(4)
+        resizeWindowKeepingTop(to: newHeight)
+    }
+    
+    private func hideSuggestions() {
+        suggestions = []
+        suggestionState = .hidden
+        suggestionsScrollView.isHidden = true
+        suggestionsHeightConstraint.constant = 0
+        resizeWindowKeepingTop(to: DictionaryViewController.initialHeight)
+    }
+    
+    private func acceptSuggestion(_ word: String) {
+        Logger.shared.log("View: 接受建议 '\(word)'")
+        isProcessingTextChange = true
+        hideResultArea()
+        hideSuggestions()
+        searchField.stringValue = word
+        isProcessingTextChange = false
+        searchWordAction()
+    }
+    
+    /// 刷新建议列表行高亮, 使伪选中行显示浅色背景.
+    private func refreshSuggestionHighlight() {
+        suggestionsTableView.enumerateAvailableRowViews { rowView, row in
+            if suggestionState == .pseudoSelected && row == 0 {
+                rowView.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.12)
+            } else {
+                rowView.backgroundColor = .clear
+            }
+        }
+    }
+    
+    @objc private func suggestionClicked(_ sender: NSTableView) {
+        let row = sender.selectedRow
+        guard row >= 0, row < suggestions.count else { return }
+        acceptSuggestion(suggestions[row])
+    }
+    
+    // MARK: NSTableViewDataSource
+    
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        return suggestions.count
+    }
+    
+    func tableView(_ tableView: NSTableView, objectValueFor tableColumn: NSTableColumn?, row: Int) -> Any? {
+        return suggestions[row]
+    }
+    
+    // MARK: NSTableViewDelegate
+    
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        if suggestionsTableView.selectedRow >= 0 {
+            suggestionState = .trulySelected
+            refreshSuggestionHighlight()
+        }
     }
 }
 

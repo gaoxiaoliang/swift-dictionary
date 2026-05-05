@@ -1447,7 +1447,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             } catch {
                 Logger.shared.error("View: 播放缓存音频失败", error: error)
             }
-        } else if data.ukspeech != nil {
+        } else {
             Logger.shared.log("View: 准备播放发音")
             playAudioAction()
         }

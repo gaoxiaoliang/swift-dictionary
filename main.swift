@@ -174,10 +174,11 @@ class Database {
         }
         sqlite3_finalize(stmt)
         
-        // 新增字段: 其他词性、近义词
+        // 新增字段: 其他词性、近义词、考试类型
         let alterSQLs = [
             "ALTER TABLE words ADD COLUMN related_words TEXT",
-            "ALTER TABLE words ADD COLUMN synonyms TEXT"
+            "ALTER TABLE words ADD COLUMN synonyms TEXT",
+            "ALTER TABLE words ADD COLUMN exam_types TEXT"
         ]
         for sql in alterSQLs {
             sqlite3_exec(db, sql, nil, nil, nil)
@@ -187,7 +188,7 @@ class Database {
     }
     
     func getWord(_ word: String) -> YoudaoResult? {
-        let querySQL = "SELECT phonetics_uk, audio_data_uk, definitions, related_words, synonyms FROM words WHERE word = ?"
+        let querySQL = "SELECT phonetics_uk, audio_data_uk, definitions, related_words, synonyms, exam_types FROM words WHERE word = ?"
         var stmt: OpaquePointer?
         
         guard sqlite3_prepare_v2(db, querySQL, -1, &stmt, nil) == SQLITE_OK else {
@@ -228,6 +229,13 @@ class Database {
                 result.synonymGroups = synArray
             }
             
+            // 读取考试类型标签
+            if let examPtr = sqlite3_column_text(stmt, 5),
+               let examData = String(cString: examPtr).data(using: .utf8),
+               let examArray = try? JSONDecoder().decode([String].self, from: examData) {
+                result.examTypes = examArray
+            }
+            
             Logger.shared.log("DB: 命中缓存 - \(word)")
             return result
         }
@@ -250,10 +258,11 @@ class Database {
     }
 
     func saveWord(_ word: String, phonetic: String?, audioData: Data?, definitions: [String],
-                  relatedWordGroups: [RelatedWordGroup], synonymGroups: [SynonymGroup]) {
+                   relatedWordGroups: [RelatedWordGroup], synonymGroups: [SynonymGroup],
+                   examTypes: [String]) {
         let insertSQL = """
-            INSERT OR REPLACE INTO words (word, phonetics_uk, audio_data_uk, definitions, related_words, synonyms, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            INSERT OR REPLACE INTO words (word, phonetics_uk, audio_data_uk, definitions, related_words, synonyms, exam_types, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
         """
         var stmt: OpaquePointer?
         
@@ -300,6 +309,14 @@ class Database {
             sqlite3_bind_text(stmt, 6, (synString as NSString).utf8String, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 6)
+        }
+        
+        // 考试类型标签 (JSON)
+        if let examData = try? JSONEncoder().encode(examTypes),
+           let examString = String(data: examData, encoding: .utf8) {
+            sqlite3_bind_text(stmt, 7, (examString as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 7)
         }
         
         if sqlite3_step(stmt) == SQLITE_DONE {
@@ -451,6 +468,7 @@ struct YoudaoResult {
     var ukspeech: String?     // URL string from API (network)
     var cachedAudioData: Data?  // Cached audio data from DB
     var definitions: [String] = []
+    var examTypes: [String] = []
     var relatedWordGroups: [RelatedWordGroup] = []
     var synonymGroups: [SynonymGroup] = []
 }
@@ -577,7 +595,13 @@ class YoudaoAPI {
                 }
                 
                 result.definitions = definitions
-
+                
+                // 解析考试类型标签 (ec.exam_type)
+                if let ecData = json["ec"] as? [String: Any],
+                   let examTypes = ecData["exam_type"] as? [String] {
+                    result.examTypes = examTypes
+                }
+                
                 // 解析其他词性 (rel_word)
                 if let relWord = json["rel_word"] as? [String: Any],
                    let rels = relWord["rels"] as? [[String: Any]] {
@@ -623,7 +647,8 @@ class YoudaoAPI {
                             Database.shared.saveWord(word, phonetic: result.ukphone, audioData: audioData,
                                                      definitions: result.definitions,
                                                      relatedWordGroups: result.relatedWordGroups,
-                                                     synonymGroups: result.synonymGroups)
+                                                     synonymGroups: result.synonymGroups,
+                                                     examTypes: result.examTypes)
                         }
                     }.resume()
                 }
@@ -660,7 +685,12 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     var definitionsTextView: NSTextView!
     var scrollView: NSScrollView!
     var scrollViewHeightConstraint: NSLayoutConstraint!
+    var scrollViewTopConstraint: NSLayoutConstraint!
     var loadingIndicator: NSProgressIndicator!
+    
+    // 考试类型标签
+    var examBadgesStack: NSStackView!
+    var examBadgesHeightConstraint: NSLayoutConstraint!
     
     var currentAudioURL: URL?
     var audioPlayer: AVAudioPlayer?
@@ -814,6 +844,15 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         playButton.isHidden = true
         view.addSubview(playButton)
         
+        // 考试类型标签行
+        examBadgesStack = NSStackView()
+        examBadgesStack.orientation = .horizontal
+        examBadgesStack.spacing = 6
+        examBadgesStack.alignment = .centerY
+        examBadgesStack.translatesAutoresizingMaskIntoConstraints = false
+        examBadgesStack.isHidden = true
+        view.addSubview(examBadgesStack)
+        
         scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
@@ -928,7 +967,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             playButton.widthAnchor.constraint(equalToConstant: 30),
             playButton.heightAnchor.constraint(equalToConstant: 30),
             
-            scrollView.topAnchor.constraint(equalTo: wordLabel.bottomAnchor, constant: 20),
+            examBadgesStack.topAnchor.constraint(equalTo: wordLabel.bottomAnchor, constant: 8),
+            examBadgesStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
 
@@ -944,6 +985,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             loadingIndicator.centerYAnchor.constraint(equalTo: view.centerYAnchor),
         ])
         
+        scrollViewTopConstraint = scrollView.topAnchor.constraint(equalTo: wordLabel.bottomAnchor, constant: 20)
+        scrollViewTopConstraint.isActive = true
+        
         scrollViewHeightConstraint = scrollView.heightAnchor.constraint(equalToConstant: 0)
         scrollViewHeightConstraint.isActive = true
 
@@ -955,6 +999,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         
         suggestionsHeightConstraint = suggestionsScrollView.heightAnchor.constraint(equalToConstant: 0)
         suggestionsHeightConstraint.isActive = true
+        
+        examBadgesHeightConstraint = examBadgesStack.heightAnchor.constraint(equalToConstant: 0)
+        examBadgesHeightConstraint.isActive = true
         
         installPasteMonitor()
         installEscMonitor()
@@ -1282,6 +1329,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         phoneticLabel.isHidden = phoneticLabel.stringValue.isEmpty
         
         playButton.isHidden = false
+        
+        // 考试类型标签
+        showExamBadges(data.examTypes)
         
         Logger.shared.log("View: 释义内容: \(data.definitions)")
         let joined = data.definitions.joined(separator: "\n")
@@ -1756,6 +1806,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         wordLabel.isHidden = true
         phoneticLabel.isHidden = true
         playButton.isHidden = true
+        hideExamBadges()
         definitionsTextView.string = ""
         scrollViewHeightConstraint.constant = 0
 
@@ -1768,9 +1819,64 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                           scrollView: relatedWordsScrollView, expanded: false)
         setSectionContent(synonymsTextView, attributedContent: nil,
                           heightConstraint: synonymsHeightConstraint,
-                          scrollView: synonymsScrollView, expanded: false)
+                           scrollView: synonymsScrollView, expanded: false)
 
         resizeWindowKeepingTop(to: DictionaryViewController.initialHeight)
+    }
+    
+    // MARK: 考试类型标签
+    
+    /// 考试类型显示名映射: API 键 -> 用户友好标签
+    private static let examTypeLabels: [String: String] = [
+        "初中": "初中", "高中": "高中",
+        "CET4": "四级", "CET6": "六级",
+        "考研": "考研", "IELTS": "雅思",
+        "TOEFL": "TOEFL", "GRE": "GRE",
+        "GMAT": "GMAT", "SAT": "SAT",
+        "商务英语": "BEC",
+    ]
+    
+    private func showExamBadges(_ examTypes: [String]) {
+        examBadgesStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        guard !examTypes.isEmpty else {
+            hideExamBadges()
+            return
+        }
+        for type in examTypes {
+            let label = Self.examTypeLabels[type] ?? type
+            examBadgesStack.addArrangedSubview(makeBadgeView(label))
+        }
+        let badgeHeight: CGFloat = 18
+        examBadgesHeightConstraint.constant = badgeHeight
+        examBadgesStack.isHidden = false
+        scrollViewTopConstraint.constant = 8 + badgeHeight + 8  // wordLabel.gap(8) + badge + gap(8)
+    }
+    
+    private func hideExamBadges() {
+        examBadgesStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        examBadgesHeightConstraint.constant = 0
+        examBadgesStack.isHidden = true
+        scrollViewTopConstraint.constant = 20
+    }
+    
+    private func makeBadgeView(_ text: String) -> NSView {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        
+        let container = NSView()
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 4
+        container.layer?.borderWidth = 0.5
+        container.layer?.borderColor = NSColor.separatorColor.cgColor
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -6),
+        ])
+        return container
     }
     
     // MARK: 搜索建议

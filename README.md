@@ -19,8 +19,11 @@ I wanted a dictionary that imposes zero friction. No Dock icon, no window huntin
 | **`↓`** | Search field focused | Expand next result section |
 | **`↑`** | Search field focused | Collapse last result section |
 | **Esc** | Window focused | Hide dictionary window (returns focus to previous app) |
+| **Ctrl+A/E/B/F** | Search field focused | Move cursor, enter edit mode (append instead of replace) |
 
-That's it. No learning curve.
+### Smart Typing
+
+After looking up a word, typing new characters **replaces** the word by default — handy for quickly searching something new. Press `Ctrl+A`, `Ctrl+E`, `Ctrl+B`, or `Ctrl+F` to enter **edit mode**, where typing appends to the current word instead.
 
 ## Features
 

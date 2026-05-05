@@ -649,10 +649,14 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     /// 当前展示结果所对应的单词, 用于在 controlTextDidChange 中识别
     /// "用户是否在已有结果末尾追加字符", 从而把追加字符视为新一次输入并覆盖原词.
     var displayedWord: String = ""
+    /// 用户是否通过 Control+A/E/B/F 等光标移动键显式进入了编辑模式.
+    /// 进入编辑模式后, 在末尾键入不再覆盖原词, 而是正常追加.
+    private var userEditingWord: Bool = false
     
     private var pasteMonitor: Any?
     private var escMonitor: Any?
     private var historyNavMonitor: Any?
+    private var emacsCursorMonitor: Any?
 
     private var backStack: [String] = []
     private var forwardStack: [String] = []
@@ -882,12 +886,14 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         installPasteMonitor()
         installEscMonitor()
         installHistoryNavigationMonitor()
+        installEmacsCursorMonitor()
     }
     
     deinit {
         if let monitor = pasteMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = escMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = historyNavMonitor { NSEvent.removeMonitor(monitor) }
+        if let monitor = emacsCursorMonitor { NSEvent.removeMonitor(monitor) }
     }
     
     /// 安装 Cmd+V 局部事件监听器: 搜索框获得焦点时, 读剪贴板 -> 清洗 -> 自动查询.
@@ -1039,6 +1045,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     private func performQuery(for word: String, recordInHistory: Bool = true) {
         Logger.shared.log("View: 查询单词 '\(word)'")
         cancelFadeOut()
+        userEditingWord = false
         displayedWord = searchField.stringValue
         showLoading(true)
 
@@ -1108,6 +1115,27 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             default:
                 return event
             }
+        }
+    }
+    
+    /// 监听 Control+A / Control+E / Control+B / Control+F 等 Emacs 风格光标移动键.
+    /// 用户按下后置位 userEditingWord 标志, 使得后续在词尾键入进入追加模式而非覆盖.
+    private func installEmacsCursorMonitor() {
+        emacsCursorMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self,
+                  let window = self.view.window,
+                  window.isKeyWindow else { return event }
+            // 仅 Control 修饰键, 不含 Command/Shift/Option
+            guard event.modifierFlags.contains(.control),
+                  !event.modifierFlags.contains(.command),
+                  !event.modifierFlags.contains(.shift),
+                  !event.modifierFlags.contains(.option) else { return event }
+            
+            let editingKeys: Set<UInt16> = [0, 14, 11, 3] // Control+A, Control+E, Control+B, Control+F
+            if editingKeys.contains(event.keyCode) {
+                self.userEditingWord = true
+            }
+            return event
         }
     }
     
@@ -1574,10 +1602,10 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         
         let current = searchField.stringValue
         
-        // 识别 "用户在已有结果末尾继续键入" 的场景:
-        // 当前字段内容 == 已查询的单词 + 追加部分. 此时视为新一次输入, 把原词覆盖为追加部分.
-        // 其他变更 (删除/选中替换/中间编辑等) 只隐藏结果区, 不改动输入框内容.
-        if !displayedWord.isEmpty,
+        // 用户在末尾追加字符 → 默认视为新一次输入, 覆盖原词.
+        // 若用户先按了 Control+A/E/B/F 进入编辑模式, 则跳过覆盖, 允许在原词上追加.
+        if !userEditingWord,
+           !displayedWord.isEmpty,
            current.count > displayedWord.count,
            current.hasPrefix(displayedWord) {
             let appended = String(current.dropFirst(displayedWord.count))
@@ -1598,6 +1626,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         cancelFadeOut()
         hasSearched = false
         displayedWord = ""
+        userEditingWord = false
         wordLabel.isHidden = true
         phoneticLabel.isHidden = true
         playButton.isHidden = true

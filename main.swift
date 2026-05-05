@@ -1710,13 +1710,14 @@ enum MainMenuBuilder {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var statusItem: NSStatusItem!
+    var previousActiveApp: NSRunningApplication?
     
     // 单击 Right Command 检测
     /// Right Cmd 按下后标记为待触发; 若释放前按了任何其他键, 则取消 (说明是组合快捷键)
     private var rightCmdTriggerPending = false
     /// 跟踪 Right Cmd 按下/释放状态, 用 toggle() 切换以避免左右 Cmd 同时按下时判断错误
     private var rightCmdIsDown = false
-    // 单击 Right Option 检测 (窗口可见时聚焦搜索框)
+    // 单击 Right Option 检测 (窗口可见时切换焦点)
     private var rightOptTriggerPending = false
     private var rightOptIsDown = false
     private var globalFlagsMonitor: Any?
@@ -1818,7 +1819,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Right Option 处理 (仅窗口可见时聚焦搜索框)
+        // Right Option 处理 (窗口可见时切换焦点: 活跃则退回原应用, 否则聚焦搜索框)
         if event.keyCode == AppDelegate.rightOptionKeyCode {
             rightOptIsDown.toggle()
             if rightOptIsDown {
@@ -1835,17 +1836,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 将焦点移到搜索框 (窗口可见时激活并聚焦, 不可见时忽略)
+    /// 焦点切换: 窗口可见时, 若 SwiftDict 活跃则退回原应用, 否则聚焦搜索框.
+    /// 窗口不可见时忽略.
     private func focusSearchField() {
         guard window.isVisible else { return }
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        if let vc = window.contentViewController as? DictionaryViewController {
-            vc.searchField.becomeFirstResponder()
-            if !vc.searchField.stringValue.isEmpty,
-               let editor = vc.searchField.currentEditor() {
-                let end = editor.string.count
-                editor.selectedRange = NSRange(location: end, length: 0)
+        
+        if NSApp.isActive {
+            // SwiftDict 当前活跃 → 将焦点退回原应用
+            if let previous = previousActiveApp, !previous.isTerminated {
+                Logger.shared.log("App: Right Option 焦点退回原应用")
+                previous.activate(options: .activateIgnoringOtherApps)
+            }
+        } else {
+            // 其他应用活跃 → 将焦点切回 SwiftDict 搜索框
+            if let frontApp = NSWorkspace.shared.frontmostApplication,
+               frontApp.bundleIdentifier != Bundle.main.bundleIdentifier {
+                previousActiveApp = frontApp
+            }
+            Logger.shared.log("App: Right Option 聚焦搜索框")
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            if let vc = window.contentViewController as? DictionaryViewController {
+                vc.searchField.becomeFirstResponder()
+                if !vc.searchField.stringValue.isEmpty,
+                   let editor = vc.searchField.currentEditor() {
+                    let end = editor.string.count
+                    editor.selectedRange = NSRange(location: end, length: 0)
+                }
             }
         }
     }
@@ -2252,8 +2269,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             window.orderOut(nil)
             window.alphaValue = 1.0  // 为下次唤起准备
+            
+            // 焦点退回原应用
+            if let previous = previousActiveApp, !previous.isTerminated {
+                previous.activate(options: .activateIgnoringOtherApps)
+            }
+            previousActiveApp = nil
         } else {
             Logger.shared.log("App: 显示窗口 - frame: \(window.frame)")
+            
+            // 记录当前活跃应用, 以便隐藏窗口后焦点退回
+            if let frontApp = NSWorkspace.shared.frontmostApplication,
+               frontApp.bundleIdentifier != Bundle.main.bundleIdentifier {
+                previousActiveApp = frontApp
+            }
+            
             window.alphaValue = 1.0  // 清除上次淡出残留
             positionWindowAtTop()
             window.makeKeyAndOrderFront(nil)

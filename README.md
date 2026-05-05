@@ -10,21 +10,22 @@ I wanted a dictionary that imposes zero friction. No Dock icon, no window huntin
 
 | Key | Context | Action |
 |---|---|---|
-| **Right Command** | Anywhere | Toggle dictionary window |
-| **Right Option** | Window visible | Focus search field |
+| **Right Command** | Anywhere | Toggle dictionary window (hiding returns focus to previous app) |
+| **Right Option** | Window visible | Toggle focus between search field and previous app |
 | **Enter** | Search field focused | Look up current input |
-| **Cmd+V** | Search field focused | Paste clipborad, clean it, look up |
+| **Cmd+V** | Search field focused | Paste clipboard, clean it, look up |
 | **`[`** | Window focused | Go back in query history |
 | **`]`** | Window focused | Go forward in query history |
 | **`↓`** | Search field focused | Expand next result section |
 | **`↑`** | Search field focused | Collapse last result section |
-| **Esc** | Window focused | Hide dictionary window |
+| **Esc** | Window focused | Hide dictionary window (returns focus to previous app) |
 
 That's it. No learning curve.
 
 ## Features
 
-- **Global hotkey** — Press Right Command from any app to summon or dismiss the window.
+- **Global hotkey** — Press Right Command from any app to summon or dismiss the window. Dismissing returns focus to your previous app at the original cursor position.
+- **Focus toggle** — Right Option toggles keyboard focus between the search field and your previous app, letting you hop back and forth without hiding the window.
 - **Paste-and-search** — `Cmd+V` with the search field focused auto-cleans clipboard text and looks it up. Works with `"don't"`, `"self-made"`, and multi-word phrases.
 - **Cached offline** — Lookups hit a local SQLite database first. Previously seen words load instantly with zero network.
 - **Audio pronunciation** — Auto-plays British pronunciation on each lookup. Click the speaker icon to replay.

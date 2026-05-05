@@ -140,194 +140,210 @@ class Database {
             Logger.shared.error("DB: 无法打开数据库", error: nil)
         } else {
             Logger.shared.log("DB: 数据库已打开")
-            createTableIfNeeded()
+            createTables()
         }
     }
     
     deinit {
-        if db != nil {
-            sqlite3_close(db)
-        }
+        if db != nil { sqlite3_close(db) }
     }
     
-    private func createTableIfNeeded() {
-        let createSQL = """
-            CREATE TABLE IF NOT EXISTS words (
+    // MARK: Schema
+    
+    private func createTables() {
+        sqlite3_exec(db, """
+            CREATE TABLE IF NOT EXISTS word_audio (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 word TEXT UNIQUE NOT NULL,
-                phonetics_uk TEXT,
-                audio_url_uk TEXT,
                 audio_data_uk BLOB,
-                definitions TEXT,
+                fully_cached INTEGER NOT NULL DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        """
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, createSQL, -1, &stmt, nil) == SQLITE_OK {
-            sqlite3_step(stmt)
-        }
-        sqlite3_finalize(stmt)
+        """, nil, nil, nil)
         
-        if sqlite3_prepare_v2(db, "CREATE INDEX IF NOT EXISTS idx_word ON words(word)", -1, &stmt, nil) == SQLITE_OK {
-            sqlite3_step(stmt)
-        }
-        sqlite3_finalize(stmt)
+        sqlite3_exec(db, """
+            CREATE TABLE IF NOT EXISTS word_info (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                word TEXT UNIQUE NOT NULL,
+                phonetics_uk TEXT,
+                definitions TEXT,
+                related_words TEXT,
+                synonyms TEXT,
+                exam_types TEXT,
+                query_count INTEGER NOT NULL DEFAULT 1,
+                fully_cached INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """, nil, nil, nil)
         
-        // 新增字段: 其他词性、近义词、考试类型
-        let alterSQLs = [
-            "ALTER TABLE words ADD COLUMN related_words TEXT",
-            "ALTER TABLE words ADD COLUMN synonyms TEXT",
-            "ALTER TABLE words ADD COLUMN exam_types TEXT"
-        ]
-        for sql in alterSQLs {
-            sqlite3_exec(db, sql, nil, nil, nil)
-        }
-        
+        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_word_audio_word ON word_audio(word)", nil, nil, nil)
+        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_word_info_word ON word_info(word)", nil, nil, nil)
         Logger.shared.log("DB: 表已准备就绪")
     }
     
-    func getWord(_ word: String) -> YoudaoResult? {
-        let querySQL = "SELECT phonetics_uk, audio_data_uk, definitions, related_words, synonyms, exam_types FROM words WHERE word = ?"
+    // MARK: Word Info
+    
+    /// 查询单词释义缓存, 返回 (结果, 是否完整缓存).
+    /// 每次调用会将查询次数 +1.
+    func getWordInfo(_ word: String) -> (result: YoudaoResult, fullyCached: Bool)? {
+        let sql = "SELECT phonetics_uk, definitions, related_words, synonyms, exam_types, fully_cached, query_count FROM word_info WHERE word = ?"
         var stmt: OpaquePointer?
-        
-        guard sqlite3_prepare_v2(db, querySQL, -1, &stmt, nil) == SQLITE_OK else {
-            return nil
-        }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(stmt) }
-        
         sqlite3_bind_text(stmt, 1, (word.lowercased() as NSString).utf8String, -1, SQLITE_TRANSIENT)
         
         if sqlite3_step(stmt) == SQLITE_ROW {
-            let phoneticPtr = sqlite3_column_text(stmt, 0)
-            let audioDataPtr = sqlite3_column_blob(stmt, 1)
-            let definitionsPtr = sqlite3_column_text(stmt, 2)
-            
             var result = YoudaoResult()
-            result.ukphone = phoneticPtr != nil ? String(cString: phoneticPtr!) : nil
+            if let ptr = sqlite3_column_text(stmt, 0) { result.ukphone = String(cString: ptr) }
             
-            if audioDataPtr != nil {
-                result.cachedAudioData = Data(bytes: audioDataPtr!, count: Int(sqlite3_column_bytes(stmt, 1)))
+            if let ptr = sqlite3_column_text(stmt, 1),
+               let data = String(cString: ptr).data(using: .utf8),
+               let arr = try? JSONSerialization.jsonObject(with: data) as? [String] {
+                result.definitions = arr
             }
+            if let ptr = sqlite3_column_text(stmt, 2),
+               let data = String(cString: ptr).data(using: .utf8),
+               let arr = try? JSONDecoder().decode([RelatedWordGroup].self, from: data) {
+                result.relatedWordGroups = arr
+            }
+            if let ptr = sqlite3_column_text(stmt, 3),
+               let data = String(cString: ptr).data(using: .utf8),
+               let arr = try? JSONDecoder().decode([SynonymGroup].self, from: data) {
+                result.synonymGroups = arr
+            }
+            if let ptr = sqlite3_column_text(stmt, 4),
+               let data = String(cString: ptr).data(using: .utf8),
+               let arr = try? JSONDecoder().decode([String].self, from: data) {
+                result.examTypes = arr
+            }
+            let fullyCached = sqlite3_column_int(stmt, 5) != 0
+            let queryCount = Int(sqlite3_column_int(stmt, 6)) + 1
+            result.queryCount = queryCount
             
-            if let defPtr = definitionsPtr, let defStr = String(cString: defPtr).data(using: .utf8),
-               let defArray = try? JSONSerialization.jsonObject(with: defStr) as? [String] {
-                result.definitions = defArray
-            }
-
-            // 读取其他词性
-            if let relPtr = sqlite3_column_text(stmt, 3),
-               let relData = String(cString: relPtr).data(using: .utf8),
-               let relArray = try? JSONDecoder().decode([RelatedWordGroup].self, from: relData) {
-                result.relatedWordGroups = relArray
-            }
-
-            // 读取近义词
-            if let synPtr = sqlite3_column_text(stmt, 4),
-               let synData = String(cString: synPtr).data(using: .utf8),
-               let synArray = try? JSONDecoder().decode([SynonymGroup].self, from: synData) {
-                result.synonymGroups = synArray
-            }
+            // 递增查询次数
+            incrementQueryCount(word)
             
-            // 读取考试类型标签
-            if let examPtr = sqlite3_column_text(stmt, 5),
-               let examData = String(cString: examPtr).data(using: .utf8),
-               let examArray = try? JSONDecoder().decode([String].self, from: examData) {
-                result.examTypes = examArray
-            }
-            
-            Logger.shared.log("DB: 命中缓存 - \(word)")
-            return result
+            Logger.shared.log("DB: 命中缓存 - \(word) (fully_cached=\(fullyCached), count=\(queryCount))")
+            return (result, fullyCached)
         }
-        
         return nil
     }
     
-    /// 返回 words 表中的记录数; 查询失败返回 0
-    func wordCount() -> Int {
-        let sql = "SELECT COUNT(*) FROM words"
+    /// 递增单词查询次数
+    private func incrementQueryCount(_ word: String) {
+        let sql = "UPDATE word_info SET query_count = query_count + 1 WHERE word = ?"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (word.lowercased() as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_step(stmt)
+    }
+    
+    func saveWordInfo(_ word: String, phonetic: String?, definitions: [String],
+                      relatedWordGroups: [RelatedWordGroup], synonymGroups: [SynonymGroup],
+                      examTypes: [String]) {
+        let sql = """
+            INSERT INTO word_info (word, phonetics_uk, definitions, related_words, synonyms, exam_types, fully_cached, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
+            ON CONFLICT(word) DO UPDATE SET
+                phonetics_uk = excluded.phonetics_uk,
+                definitions = excluded.definitions,
+                related_words = excluded.related_words,
+                synonyms = excluded.synonyms,
+                exam_types = excluded.exam_types,
+                fully_cached = 1,
+                updated_at = datetime('now')
+        """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            return 0
+            Logger.shared.error("DB: 保存 word_info 失败", error: nil)
+            return
         }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (word.lowercased() as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        if let p = phonetic {
+            sqlite3_bind_text(stmt, 2, (p as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        } else { sqlite3_bind_null(stmt, 2) }
+        
+        if let d = try? JSONSerialization.data(withJSONObject: definitions),
+           let s = String(data: d, encoding: .utf8) {
+            sqlite3_bind_text(stmt, 3, (s as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        } else { sqlite3_bind_null(stmt, 3) }
+        
+        if let d = try? JSONEncoder().encode(relatedWordGroups),
+           let s = String(data: d, encoding: .utf8) {
+            sqlite3_bind_text(stmt, 4, (s as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        } else { sqlite3_bind_null(stmt, 4) }
+        
+        if let d = try? JSONEncoder().encode(synonymGroups),
+           let s = String(data: d, encoding: .utf8) {
+            sqlite3_bind_text(stmt, 5, (s as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        } else { sqlite3_bind_null(stmt, 5) }
+        
+        if let d = try? JSONEncoder().encode(examTypes),
+           let s = String(data: d, encoding: .utf8) {
+            sqlite3_bind_text(stmt, 6, (s as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        } else { sqlite3_bind_null(stmt, 6) }
+        
+        if sqlite3_step(stmt) == SQLITE_DONE {
+            Logger.shared.log("DB: word_info 已保存 - \(word)")
+        }
+    }
+    
+    // MARK: Word Audio
+    
+    func getWordAudio(_ word: String) -> Data? {
+        let sql = "SELECT audio_data_uk FROM word_audio WHERE word = ?"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (word.lowercased() as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        if sqlite3_step(stmt) == SQLITE_ROW, let ptr = sqlite3_column_blob(stmt, 0) {
+            return Data(bytes: ptr, count: Int(sqlite3_column_bytes(stmt, 0)))
+        }
+        return nil
+    }
+    
+    func saveWordAudio(_ word: String, audioData: Data) {
+        let sql = """
+            INSERT OR REPLACE INTO word_audio (word, audio_data_uk, fully_cached, created_at, updated_at)
+            VALUES (?, ?, 1, datetime('now'), datetime('now'))
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            Logger.shared.error("DB: 保存 word_audio 失败", error: nil)
+            return
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (word.lowercased() as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        audioData.withUnsafeBytes { buf in
+            if let addr = buf.baseAddress {
+                sqlite3_bind_blob(stmt, 2, addr, Int32(audioData.count), SQLITE_TRANSIENT)
+            }
+        }
+        if sqlite3_step(stmt) == SQLITE_DONE {
+            Logger.shared.log("DB: word_audio 已保存 - \(word)")
+        }
+    }
+    
+    // MARK: Queries
+    
+    func wordCount() -> Int {
+        let sql = "SELECT COUNT(*) FROM word_info"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
         defer { sqlite3_finalize(stmt) }
         if sqlite3_step(stmt) == SQLITE_ROW {
             return Int(sqlite3_column_int64(stmt, 0))
         }
         return 0
     }
-
-    func saveWord(_ word: String, phonetic: String?, audioData: Data?, definitions: [String],
-                   relatedWordGroups: [RelatedWordGroup], synonymGroups: [SynonymGroup],
-                   examTypes: [String]) {
-        let insertSQL = """
-            INSERT OR REPLACE INTO words (word, phonetics_uk, audio_data_uk, definitions, related_words, synonyms, exam_types, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-        """
-        var stmt: OpaquePointer?
-        
-        guard sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nil) == SQLITE_OK else {
-            Logger.shared.error("DB: 保存失败", error: nil)
-            return
-        }
-        defer { sqlite3_finalize(stmt) }
-        
-        sqlite3_bind_text(stmt, 1, (word.lowercased() as NSString).utf8String, -1, SQLITE_TRANSIENT)
-        
-        if let phonetic = phonetic {
-            sqlite3_bind_text(stmt, 2, (phonetic as NSString).utf8String, -1, SQLITE_TRANSIENT)
-        } else {
-            sqlite3_bind_null(stmt, 2)
-        }
-        
-        if let audioData = audioData {
-            audioData.withUnsafeBytes { rawBuffer in
-                if let baseAddr = rawBuffer.baseAddress {
-                    sqlite3_bind_blob(stmt, 3, baseAddr, Int32(audioData.count), SQLITE_TRANSIENT)
-                }
-            }
-        } else {
-            sqlite3_bind_null(stmt, 3)
-        }
-        
-        if let defData = try? JSONSerialization.data(withJSONObject: definitions, options: []),
-           let defString = String(data: defData, encoding: .utf8) {
-            sqlite3_bind_text(stmt, 4, (defString as NSString).utf8String, -1, SQLITE_TRANSIENT)
-        }
-
-        // 其他词性 (JSON)
-        if let relData = try? JSONEncoder().encode(relatedWordGroups),
-           let relString = String(data: relData, encoding: .utf8) {
-            sqlite3_bind_text(stmt, 5, (relString as NSString).utf8String, -1, SQLITE_TRANSIENT)
-        } else {
-            sqlite3_bind_null(stmt, 5)
-        }
-
-        // 近义词 (JSON)
-        if let synData = try? JSONEncoder().encode(synonymGroups),
-           let synString = String(data: synData, encoding: .utf8) {
-            sqlite3_bind_text(stmt, 6, (synString as NSString).utf8String, -1, SQLITE_TRANSIENT)
-        } else {
-            sqlite3_bind_null(stmt, 6)
-        }
-        
-        // 考试类型标签 (JSON)
-        if let examData = try? JSONEncoder().encode(examTypes),
-           let examString = String(data: examData, encoding: .utf8) {
-            sqlite3_bind_text(stmt, 7, (examString as NSString).utf8String, -1, SQLITE_TRANSIENT)
-        } else {
-            sqlite3_bind_null(stmt, 7)
-        }
-        
-        if sqlite3_step(stmt) == SQLITE_DONE {
-            Logger.shared.log("DB: 已保存 - \(word)")
-        }
-    }
     
-    /// 前缀匹配查询缓存单词, 按长度升序、同长度字典序排列, 最多返回 limit 条.
     func queryWordsByPrefix(_ prefix: String, limit: Int = 20) -> [String] {
         guard let db = db else { return [] }
-        let sql = "SELECT word FROM words WHERE word LIKE ? ORDER BY LENGTH(word), word LIMIT ?"
+        let sql = "SELECT word FROM word_info WHERE word LIKE ? ORDER BY LENGTH(word), word LIMIT ?"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(stmt) }
@@ -469,6 +485,7 @@ struct YoudaoResult {
     var cachedAudioData: Data?  // Cached audio data from DB
     var definitions: [String] = []
     var examTypes: [String] = []
+    var queryCount: Int = 0
     var relatedWordGroups: [RelatedWordGroup] = []
     var synonymGroups: [SynonymGroup] = []
 }
@@ -504,9 +521,14 @@ class YoudaoAPI {
     func query(word: String, completion: @escaping (Result<YoudaoResult, Error>) -> Void) {
         Logger.shared.log("API: 开始查询单词 '\(word)'")
         
-        if let cached = Database.shared.getWord(word) {
-            Logger.shared.log("API: 使用缓存 - \(word)")
-            completion(.success(cached))
+        // 查询缓存: (结果, 是否完整缓存)
+        let cachedInfo = Database.shared.getWordInfo(word)
+        
+        if let (cached, fullyCached) = cachedInfo, fullyCached {
+            Logger.shared.log("API: 缓存完整，直接使用 - \(word)")
+            var result = cached
+            result.cachedAudioData = Database.shared.getWordAudio(word)
+            completion(.success(result))
             return
         }
         
@@ -514,7 +536,14 @@ class YoudaoAPI {
         let urlString = "https://dict.youdao.com/jsonapi?q=\(encodedWord)&client=deskdict&dict=ec&le=eng"
         guard let url = URL(string: urlString) else {
             Logger.shared.error("API: 无效URL", error: nil)
-            completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+            // 若有残留缓存则使用
+            if let (cached, _) = cachedInfo {
+                var result = cached
+                result.cachedAudioData = Database.shared.getWordAudio(word)
+                completion(.success(result))
+            } else {
+                completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+            }
             return
         }
         
@@ -527,20 +556,40 @@ class YoudaoAPI {
         URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
                 Logger.shared.error("API: 网络错误", error: error)
-                completion(.failure(DictionaryQueryError.network(underlying: error)))
+                // 网络失败时使用残留缓存
+                if let (cached, _) = cachedInfo {
+                    Logger.shared.log("API: 网络失败，使用残留缓存 - \(word)")
+                    var result = cached
+                    result.cachedAudioData = Database.shared.getWordAudio(word)
+                    completion(.success(result))
+                } else {
+                    completion(.failure(DictionaryQueryError.network(underlying: error)))
+                }
                 return
             }
             
             guard let data = data else {
                 Logger.shared.error("API: 无数据", error: nil)
-                completion(.failure(DictionaryQueryError.invalidResponse))
+                if let (cached, _) = cachedInfo {
+                    var result = cached
+                    result.cachedAudioData = Database.shared.getWordAudio(word)
+                    completion(.success(result))
+                } else {
+                    completion(.failure(DictionaryQueryError.invalidResponse))
+                }
                 return
             }
             
             do {
                 guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     Logger.shared.error("API: JSON 根节点不是 object", error: nil)
-                    completion(.failure(DictionaryQueryError.invalidResponse))
+                    if let (cached, _) = cachedInfo {
+                        var result = cached
+                        result.cachedAudioData = Database.shared.getWordAudio(word)
+                        completion(.success(result))
+                    } else {
+                        completion(.failure(DictionaryQueryError.invalidResponse))
+                    }
                     return
                 }
                 
@@ -551,10 +600,22 @@ class YoudaoAPI {
                     let suggestions = Self.parseTypoSuggestions(from: json)
                     if suggestions.isEmpty {
                         Logger.shared.log("API: 未找到 '\(word)' 且无拼写建议")
-                        completion(.failure(DictionaryQueryError.notFound(input: word)))
+                        if let (cached, _) = cachedInfo {
+                            var result = cached
+                            result.cachedAudioData = Database.shared.getWordAudio(word)
+                            completion(.success(result))
+                        } else {
+                            completion(.failure(DictionaryQueryError.notFound(input: word)))
+                        }
                     } else {
                         Logger.shared.log("API: 未找到 '\(word)', 返回 \(suggestions.count) 个拼写建议")
-                        completion(.failure(DictionaryQueryError.notFoundWithSuggestions(input: word, suggestions: suggestions)))
+                        if let (cached, _) = cachedInfo {
+                            var result = cached
+                            result.cachedAudioData = Database.shared.getWordAudio(word)
+                            completion(.success(result))
+                        } else {
+                            completion(.failure(DictionaryQueryError.notFoundWithSuggestions(input: word, suggestions: suggestions)))
+                        }
                     }
                     return
                 }
@@ -640,15 +701,23 @@ class YoudaoAPI {
                 
                 Logger.shared.log("API: 查询成功 - \(result.definitions.count) 个释义, 内容: \(definitions)")
                 
+                // 立即保存 word_info (fully_cached=1)
+                Database.shared.saveWordInfo(word, phonetic: result.ukphone, definitions: result.definitions,
+                                             relatedWordGroups: result.relatedWordGroups,
+                                             synonymGroups: result.synonymGroups,
+                                             examTypes: result.examTypes)
+                
+                // 首次查询的单词, queryCount 设为 1
+                if cachedInfo == nil {
+                    result.queryCount = 1
+                }
+                
+                // 异步下载音频保存到 word_audio
                 if result.ukspeech != nil {
                     let audioURL = URL(string: "https://dict.youdao.com/speech?word=\(word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word)&type=1")!
                     URLSession.shared.dataTask(with: audioURL) { audioData, _, _ in
                         if let audioData = audioData {
-                            Database.shared.saveWord(word, phonetic: result.ukphone, audioData: audioData,
-                                                     definitions: result.definitions,
-                                                     relatedWordGroups: result.relatedWordGroups,
-                                                     synonymGroups: result.synonymGroups,
-                                                     examTypes: result.examTypes)
+                            Database.shared.saveWordAudio(word, audioData: audioData)
                         }
                     }.resume()
                 }
@@ -656,7 +725,13 @@ class YoudaoAPI {
                 completion(.success(result))
             } catch {
                 Logger.shared.error("API: JSON解析错误", error: error)
-                completion(.failure(DictionaryQueryError.invalidResponse))
+                if let (cached, _) = cachedInfo {
+                    var result = cached
+                    result.cachedAudioData = Database.shared.getWordAudio(word)
+                    completion(.success(result))
+                } else {
+                    completion(.failure(DictionaryQueryError.invalidResponse))
+                }
             }
         }.resume()
     }
@@ -1331,7 +1406,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         playButton.isHidden = false
         
         // 考试类型标签
-        showExamBadges(data.examTypes)
+        showExamBadges(data.examTypes, queryCount: data.queryCount)
         
         Logger.shared.log("View: 释义内容: \(data.definitions)")
         let joined = data.definitions.joined(separator: "\n")
@@ -1826,30 +1901,42 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     
     // MARK: 考试类型标签
     
+    /// 允许显示的考试类型, 按此顺序排列
+    private static let examTypeOrder: [String] = ["初中", "高中", "CET4", "CET6", "考研", "IELTS", "GRE"]
+    
     /// 考试类型显示名映射: API 键 -> 用户友好标签
     private static let examTypeLabels: [String: String] = [
         "初中": "初中", "高中": "高中",
         "CET4": "四级", "CET6": "六级",
-        "考研": "考研", "IELTS": "雅思",
-        "TOEFL": "TOEFL", "GRE": "GRE",
-        "GMAT": "GMAT", "SAT": "SAT",
-        "商务英语": "BEC",
+        "考研": "考研", "IELTS": "雅思", "GRE": "GRE",
     ]
     
-    private func showExamBadges(_ examTypes: [String]) {
+    private func showExamBadges(_ examTypes: [String], queryCount: Int) {
         examBadgesStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        guard !examTypes.isEmpty else {
+        
+        // 按指定顺序过滤 & 排序
+        let ordered = Self.examTypeOrder.compactMap { key in
+            examTypes.contains(key) ? (Self.examTypeLabels[key] ?? key) : nil
+        }
+        
+        guard !ordered.isEmpty else {
             hideExamBadges()
             return
         }
-        for type in examTypes {
-            let label = Self.examTypeLabels[type] ?? type
+        
+        for label in ordered {
             examBadgesStack.addArrangedSubview(makeBadgeView(label))
         }
+        
+        // 查询次数标签
+        if queryCount > 0 {
+            examBadgesStack.addArrangedSubview(makeBadgeView("已查\(queryCount)次"))
+        }
+        
         let badgeHeight: CGFloat = 18
         examBadgesHeightConstraint.constant = badgeHeight
         examBadgesStack.isHidden = false
-        scrollViewTopConstraint.constant = 8 + badgeHeight + 8  // wordLabel.gap(8) + badge + gap(8)
+        scrollViewTopConstraint.constant = 8 + badgeHeight + 8
     }
     
     private func hideExamBadges() {

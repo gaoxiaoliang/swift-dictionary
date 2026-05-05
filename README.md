@@ -37,6 +37,8 @@ As you type, matching words from your lookup history appear in a dropdown. Sorte
 - **Paste-and-search** — `Cmd+V` with the search field focused auto-cleans clipboard text and looks it up. Works with `"don't"`, `"self-made"`, and multi-word phrases.
 - **Cached offline** — Lookups hit a local SQLite database first. Previously seen words load instantly with zero network.
 - **Search suggestions** — Prefix-matched suggestions from your lookup history appear as you type. Tab to accept, arrow keys to navigate.
+- **Exam tags** — Words display their exam categories (高中, CET4, CET6, 考研, IELTS, GRE) as rounded badges above definitions.
+- **Query count** — Each word tracks how many times you've looked it up, shown as a badge alongside exam tags.
 - **Audio pronunciation** — Auto-plays British pronunciation on each lookup. Click the speaker icon to replay.
 - **Word history** — `[` and `]` navigate your recent queries like a browser's back/forward. Up to 100 entries.
 - **Related words & synonyms** — Optional sections below definitions showing other POS forms and synonyms (toggle in settings or with `↓`/`↑`).

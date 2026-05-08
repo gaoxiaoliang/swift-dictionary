@@ -22,8 +22,9 @@ swiftc -o /dev/null main.swift BuildInfo.swift -lsqlite3 -O   # compile check on
 
 - `AppDelegate` owns the window, global hotkey monitors (Right Command / Right Option), status bar item, and app lifecycle.
 - `DictionaryViewController` owns all UI (search field, results, suggestions, exam badges) and keyboard event monitors.
-- `Database` is a singleton. **Do not put schema migration logic in Swift.** Use `sqlite3` CLI directly against `~/Library/Application Support/SwiftDict/dictionary.db`.
+- `Database` is a singleton. **Do not put schema migration logic in Swift.** Use `sqlite3` CLI, a shell script, or a standalone Swift/Python script to perform table structure and data migrations. The app's own code should only know about the current schema.
 - Two tables: `word_audio` (BLOB) and `word_info` (definitions, exam types, query count). Each has a `fully_cached` flag — `true` means skip network, `false` means refresh from API (with stale-cache fallback on failure).
+- **Maximize cache reuse.** When adding features or refactoring, always migrate existing SQLite data into the new shape rather than discarding it. Prefer `ALTER TABLE` + `UPDATE` over dropping and re-creating.
 - `YoudaoAPI` parses `https://dict.youdao.com/jsonapi?q=...&client=deskdict&dict=ec&le=eng`. Important JSON paths: `ec.word[0].trs` (definitions), `ec.exam_type` (exam labels), `rel_word.rels` (related words), `syno.synos` (synonyms).
 - `LSUIElement = true` — app has no Dock icon, no Cmd+Tab entry. Requires Accessibility permission for the Right Command global hotkey (`addGlobalMonitorForEvents`).
 

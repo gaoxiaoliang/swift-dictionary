@@ -40,7 +40,6 @@ CI workflow: `.github/workflows/release.yml`. Must have `permissions: contents: 
 
 - The authenticated `gh` CLI is available — use it for release checks, workflow logs, and GitHub API tasks.
 - On commit: push directly to `origin master`. If the push is rejected, stop and report the failure rather than force-pushing or retrying silently.
-- Note: `git push` may fail in non-interactive shells because git cannot access the macOS Keychain for HTTPS credentials. Use SSH remote or pre-configured credential store as needed.
 
 ## Conventions
 

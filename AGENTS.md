@@ -49,3 +49,4 @@ CI workflow: `.github/workflows/release.yml`. Must have `permissions: contents: 
 - UI is all programmatic — no storyboards, no xibs.
 - Local event monitors (`addLocalMonitorForEvents`) are used for paste, Esc, arrow keys, Emacs cursor keys, and suggestion navigation. Always check `isKeyWindow` and `firstResponder` before acting.
 - Window height is dynamic (`resizeWindowKeepingTop`). The window is `.floating` level, positioned at the top of the screen.
+- **After every code change, run `make install`** so the user can immediately test the app locally.

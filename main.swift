@@ -752,7 +752,7 @@ class YoudaoAPI {
 
 // MARK: - Dictionary View Controller
 
-class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextViewDelegate, NSTableViewDelegate, NSTableViewDataSource {
+class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextViewDelegate, NSTableViewDelegate, NSTableViewDataSource, AVAudioPlayerDelegate {
     var searchField: NSTextField!
     var wordLabel: NSTextField!
     var phoneticLabel: NSTextField!
@@ -770,6 +770,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     var currentAudioURL: URL?
     var audioPlayer: AVAudioPlayer?
     var hasSearched: Bool = false
+    private var isQuerying: Bool = false
+    private var isAudioLoading: Bool = false
+    private var audioLoadingIndicator: NSProgressIndicator!
     /// 当前展示结果所对应的单词, 用于在 controlTextDidChange 中识别
     /// "用户是否在已有结果末尾追加字符", 从而把追加字符视为新一次输入并覆盖原词.
     var displayedWord: String = ""
@@ -917,7 +920,15 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         playButton.bezelStyle = .circular
         playButton.translatesAutoresizingMaskIntoConstraints = false
         playButton.isHidden = true
+        playButton.wantsLayer = true
         view.addSubview(playButton)
+        
+        audioLoadingIndicator = NSProgressIndicator()
+        audioLoadingIndicator.style = .spinning
+        audioLoadingIndicator.controlSize = .small
+        audioLoadingIndicator.translatesAutoresizingMaskIntoConstraints = false
+        audioLoadingIndicator.isHidden = true
+        view.addSubview(audioLoadingIndicator)
         
         // 考试类型标签行
         examBadgesStack = NSStackView()
@@ -1041,6 +1052,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             playButton.leadingAnchor.constraint(equalTo: phoneticLabel.trailingAnchor, constant: 15),
             playButton.widthAnchor.constraint(equalToConstant: 30),
             playButton.heightAnchor.constraint(equalToConstant: 30),
+            
+            audioLoadingIndicator.centerXAnchor.constraint(equalTo: playButton.centerXAnchor),
+            audioLoadingIndicator.centerYAnchor.constraint(equalTo: playButton.centerYAnchor),
             
             examBadgesStack.topAnchor.constraint(equalTo: wordLabel.bottomAnchor, constant: 8),
             examBadgesStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
@@ -1252,11 +1266,15 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         cancelFadeOut()
         userEditingWord = false
         displayedWord = searchField.stringValue
+        stopAudioPlayback()
+        isQuerying = true
+        searchField.isEditable = false
         showLoading(true)
 
         YoudaoAPI.shared.query(word: word) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                self.isQuerying = false
                 self.showLoading(false)
                 switch result {
                 case .success(let data):
@@ -1265,6 +1283,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                     }
                     self.displayResult(data, word: word)
                 case .failure(let error):
+                    self.searchField.isEditable = true
                     self.handleQueryError(error, forWord: word)
                 }
             }
@@ -1440,16 +1459,24 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
 
         if let cachedData = data.cachedAudioData {
             Logger.shared.log("View: 使用缓存音频 \(cachedData.count) bytes")
+            playButton.isHidden = false
             do {
                 audioPlayer = try AVAudioPlayer(data: cachedData)
+                audioPlayer?.delegate = self
                 audioPlayer?.play()
+                startPlayButtonPulseAnimation()
                 Logger.shared.log("View: 播放缓存音频")
             } catch {
                 Logger.shared.error("View: 播放缓存音频失败", error: error)
+                searchField.isEditable = true
             }
         } else {
             Logger.shared.log("View: 准备播放发音")
-            playAudioAction()
+            isAudioLoading = true
+            playButton.isHidden = true
+            audioLoadingIndicator.isHidden = false
+            audioLoadingIndicator.startAnimation(nil)
+            downloadAndPlayAudio()
         }
     }
     
@@ -1680,27 +1707,84 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     }
     
     @objc func playAudioAction() {
+        stopAudioPlayback()
+        if let url = currentAudioURL {
+            Logger.shared.log("View: 重播音频")
+            isAudioLoading = true
+            playButton.isHidden = true
+            audioLoadingIndicator.isHidden = false
+            audioLoadingIndicator.startAnimation(nil)
+            searchField.isEditable = false
+            downloadAndPlayAudio(from: url)
+        }
+    }
+    
+    private func downloadAndPlayAudio() {
         guard let url = currentAudioURL else { return }
-        
+        downloadAndPlayAudio(from: url)
+    }
+    
+    private func downloadAndPlayAudio(from url: URL) {
         Logger.shared.log("View: 开始下载音频")
         
         URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
-            guard let data = data, error == nil else {
-                Logger.shared.error("View: 音频下载失败", error: error)
-                return
-            }
-            Logger.shared.log("View: 音频下载成功 \(data.count) bytes")
-            
             DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isAudioLoading = false
+                self.audioLoadingIndicator.stopAnimation(nil)
+                self.audioLoadingIndicator.isHidden = true
+                self.playButton.isHidden = false
+                
+                guard let data = data, error == nil else {
+                    Logger.shared.error("View: 音频下载失败", error: error)
+                    self.searchField.isEditable = true
+                    return
+                }
+                Logger.shared.log("View: 音频下载成功 \(data.count) bytes")
+                
                 do {
-                    self?.audioPlayer = try AVAudioPlayer(data: data)
-                    self?.audioPlayer?.play()
+                    self.audioPlayer = try AVAudioPlayer(data: data)
+                    self.audioPlayer?.delegate = self
+                    self.audioPlayer?.play()
+                    self.startPlayButtonPulseAnimation()
                     Logger.shared.log("View: 开始播放音频")
                 } catch {
                     Logger.shared.error("View: 播放失败", error: error)
+                    self.searchField.isEditable = true
                 }
             }
         }.resume()
+    }
+    
+    private func startPlayButtonPulseAnimation() {
+        stopPlayButtonPulseAnimation()
+        let pulse = CABasicAnimation(keyPath: "transform.scale")
+        pulse.duration = 0.8
+        pulse.fromValue = 1.0
+        pulse.toValue = 1.35
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        playButton.layer?.add(pulse, forKey: "pulse")
+    }
+    
+    private func stopPlayButtonPulseAnimation() {
+        playButton.layer?.removeAnimation(forKey: "pulse")
+    }
+    
+    private func stopAudioPlayback() {
+        audioPlayer?.stop()
+        audioPlayer = nil
+        stopPlayButtonPulseAnimation()
+        isAudioLoading = false
+        audioLoadingIndicator.stopAnimation(nil)
+        audioLoadingIndicator.isHidden = true
+    }
+    
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Logger.shared.log("View: 音频播放完成")
+        stopPlayButtonPulseAnimation()
+        searchField.isEditable = true
     }
     
     func showLoading(_ show: Bool) {
@@ -1716,6 +1800,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     /// 在释义区显示一条居中、灰色的占位/状态提示 (无拼写建议时使用)
     func showPlaceholderMessage(_ message: String) {
         Logger.shared.log("View: 显示提示 - \(message)")
+        stopAudioPlayback()
         wordLabel.isHidden = true
         phoneticLabel.isHidden = true
         playButton.isHidden = true
@@ -1737,6 +1822,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     /// "未找到" 状态: 居中灰色提示 + 可点击的拼写建议列表
     func showNotFound(input: String, suggestions: [TypoSuggestion]) {
         Logger.shared.log("View: 未找到 '\(input)', 建议数=\(suggestions.count)")
+        stopAudioPlayback()
         wordLabel.isHidden = true
         phoneticLabel.isHidden = true
         playButton.isHidden = true
@@ -1875,12 +1961,15 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     /// 同时取消正在进行的淡出 —— 用户正在编辑意味着希望窗口继续可见.
     func hideResultArea() {
         cancelFadeOut()
+        stopAudioPlayback()
         hasSearched = false
         displayedWord = ""
         userEditingWord = false
+        searchField.isEditable = true
         wordLabel.isHidden = true
         phoneticLabel.isHidden = true
         playButton.isHidden = true
+        audioLoadingIndicator.isHidden = true
         hideExamBadges()
         definitionsTextView.string = ""
         scrollViewHeightConstraint.constant = 0

@@ -1924,6 +1924,9 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                 acceptSuggestion(suggestions[0])
                 return true
             }
+            hideSuggestions()
+            searchWordAction()
+            return true
         }
         return false
     }

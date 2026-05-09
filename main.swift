@@ -2827,8 +2827,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             window.orderOut(nil)
             window.alphaValue = 1.0  // 为下次唤起准备
             
-            // 焦点退回原应用
-            if let previous = previousActiveApp, !previous.isTerminated {
+            // 焦点退回原应用: 仅在 SwiftDict 当前为活跃应用时执行.
+            // 若用户在此前已手动切换到其他应用, 则不夺走焦点.
+            if NSApp.isActive, let previous = previousActiveApp, !previous.isTerminated {
                 previous.activate(options: .activateIgnoringOtherApps)
             }
             previousActiveApp = nil

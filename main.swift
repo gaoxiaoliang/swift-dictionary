@@ -9,6 +9,15 @@ import SQLite3
 // avoiding dangling pointer issues when binding temporary Swift-managed strings/blobs.
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+private func elapsedSeconds(since start: DispatchTime) -> Double {
+    Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
+}
+
+private func formatSeconds(_ seconds: Double?) -> String {
+    guard let seconds = seconds else { return "n/a" }
+    return String(format: "%.3fs", seconds)
+}
+
 // MARK: - App Paths
 
 /// 应用用户态存储目录 (遵循 macOS 惯例).
@@ -294,14 +303,16 @@ class Database {
     
     // MARK: Word Audio
     
-    func getWordAudio(_ word: String) -> Data? {
-        let sql = "SELECT audio_data_uk FROM word_audio WHERE word = ?"
+    func getWordAudioInfo(_ word: String) -> (data: Data, fullyCached: Bool)? {
+        let sql = "SELECT audio_data_uk, fully_cached FROM word_audio WHERE word = ?"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_text(stmt, 1, (word.lowercased() as NSString).utf8String, -1, SQLITE_TRANSIENT)
         if sqlite3_step(stmt) == SQLITE_ROW, let ptr = sqlite3_column_blob(stmt, 0) {
-            return Data(bytes: ptr, count: Int(sqlite3_column_bytes(stmt, 0)))
+            let data = Data(bytes: ptr, count: Int(sqlite3_column_bytes(stmt, 0)))
+            let fullyCached = sqlite3_column_int(stmt, 1) != 0
+            return (data, fullyCached)
         }
         return nil
     }
@@ -479,6 +490,23 @@ struct SynonymGroup: Codable {
     let translation: String
 }
 
+final class QueryTelemetry {
+    let queryStartedAt: DispatchTime
+    var definitionCacheHit: Bool?
+    var definitionCacheFullyCached: Bool?
+    var definitionCacheLookupSeconds: Double?
+    var definitionAPIDurationSeconds: Double?
+    var definitionUsedStaleFallback = false
+    var audioCacheHit: Bool?
+    var audioCacheFullyCached: Bool?
+    var audioCacheLookupSeconds: Double?
+    var audioAPIDurationSeconds: Double?
+
+    init(queryStartedAt: DispatchTime = .now()) {
+        self.queryStartedAt = queryStartedAt
+    }
+}
+
 struct YoudaoResult {
     var ukphone: String?
     var ukspeech: String?     // URL string from API (network)
@@ -488,6 +516,7 @@ struct YoudaoResult {
     var queryCount: Int = 0
     var relatedWordGroups: [RelatedWordGroup] = []
     var synonymGroups: [SynonymGroup] = []
+    var queryTelemetry: QueryTelemetry?
 }
 
 /// 拼写建议 (词条未收录时由有道返回的 typos.typo)
@@ -518,19 +547,37 @@ class YoudaoAPI {
         "Referer": "https://www.youdao.com/"
     ]
     
-    func query(word: String, completion: @escaping (Result<YoudaoResult, Error>) -> Void) {
+    func query(word: String, queryStartedAt: DispatchTime = .now(), completion: @escaping (Result<YoudaoResult, Error>) -> Void) {
+        let telemetry = QueryTelemetry(queryStartedAt: queryStartedAt)
         Logger.shared.log("API: 开始查询单词 '\(word)'")
         
         // 查询缓存: (结果, 是否完整缓存)
+        let definitionCacheStart = DispatchTime.now()
         let cachedInfo = Database.shared.getWordInfo(word)
+        telemetry.definitionCacheLookupSeconds = elapsedSeconds(since: definitionCacheStart)
         
         if let (cached, fullyCached) = cachedInfo, fullyCached {
+            telemetry.definitionCacheHit = true
+            telemetry.definitionCacheFullyCached = true
             Logger.shared.log("API: 缓存完整，直接使用 - \(word)")
             var result = cached
-            result.cachedAudioData = Database.shared.getWordAudio(word)
+            let audioCacheStart = DispatchTime.now()
+            let cachedAudio = Database.shared.getWordAudioInfo(word)
+            telemetry.audioCacheLookupSeconds = elapsedSeconds(since: audioCacheStart)
+            if let cachedAudio = cachedAudio, cachedAudio.fullyCached {
+                telemetry.audioCacheHit = true
+                telemetry.audioCacheFullyCached = true
+                result.cachedAudioData = cachedAudio.data
+            } else {
+                telemetry.audioCacheHit = false
+                telemetry.audioCacheFullyCached = cachedAudio?.fullyCached
+            }
+            result.queryTelemetry = telemetry
             completion(.success(result))
             return
         }
+        telemetry.definitionCacheHit = false
+        telemetry.definitionCacheFullyCached = cachedInfo?.fullyCached
         
         let encodedWord = word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word
         let urlString = "https://dict.youdao.com/jsonapi?q=\(encodedWord)&client=deskdict&dict=ec&le=eng"
@@ -538,8 +585,20 @@ class YoudaoAPI {
             Logger.shared.error("API: 无效URL", error: nil)
             // 若有残留缓存则使用
             if let (cached, _) = cachedInfo {
+                telemetry.definitionUsedStaleFallback = true
                 var result = cached
-                result.cachedAudioData = Database.shared.getWordAudio(word)
+                let audioCacheStart = DispatchTime.now()
+                let cachedAudio = Database.shared.getWordAudioInfo(word)
+                telemetry.audioCacheLookupSeconds = elapsedSeconds(since: audioCacheStart)
+                if let cachedAudio = cachedAudio, cachedAudio.fullyCached {
+                    telemetry.audioCacheHit = true
+                    telemetry.audioCacheFullyCached = true
+                    result.cachedAudioData = cachedAudio.data
+                } else {
+                    telemetry.audioCacheHit = false
+                    telemetry.audioCacheFullyCached = cachedAudio?.fullyCached
+                }
+                result.queryTelemetry = telemetry
                 completion(.success(result))
             } else {
                 completion(.failure(NSError(domain: "Invalid URL", code: -1)))
@@ -553,14 +612,28 @@ class YoudaoAPI {
             request.setValue(value, forHTTPHeaderField: key)
         }
         
+        let definitionAPIStart = DispatchTime.now()
         URLSession.shared.dataTask(with: request) { data, response, error in
+            telemetry.definitionAPIDurationSeconds = elapsedSeconds(since: definitionAPIStart)
             if let error = error {
                 Logger.shared.error("API: 网络错误", error: error)
                 // 网络失败时使用残留缓存
                 if let (cached, _) = cachedInfo {
                     Logger.shared.log("API: 网络失败，使用残留缓存 - \(word)")
+                    telemetry.definitionUsedStaleFallback = true
                     var result = cached
-                    result.cachedAudioData = Database.shared.getWordAudio(word)
+                    let audioCacheStart = DispatchTime.now()
+                    let cachedAudio = Database.shared.getWordAudioInfo(word)
+                    telemetry.audioCacheLookupSeconds = elapsedSeconds(since: audioCacheStart)
+                    if let cachedAudio = cachedAudio, cachedAudio.fullyCached {
+                        telemetry.audioCacheHit = true
+                        telemetry.audioCacheFullyCached = true
+                        result.cachedAudioData = cachedAudio.data
+                    } else {
+                        telemetry.audioCacheHit = false
+                        telemetry.audioCacheFullyCached = cachedAudio?.fullyCached
+                    }
+                    result.queryTelemetry = telemetry
                     completion(.success(result))
                 } else {
                     completion(.failure(DictionaryQueryError.network(underlying: error)))
@@ -571,8 +644,20 @@ class YoudaoAPI {
             guard let data = data else {
                 Logger.shared.error("API: 无数据", error: nil)
                 if let (cached, _) = cachedInfo {
+                    telemetry.definitionUsedStaleFallback = true
                     var result = cached
-                    result.cachedAudioData = Database.shared.getWordAudio(word)
+                    let audioCacheStart = DispatchTime.now()
+                    let cachedAudio = Database.shared.getWordAudioInfo(word)
+                    telemetry.audioCacheLookupSeconds = elapsedSeconds(since: audioCacheStart)
+                    if let cachedAudio = cachedAudio, cachedAudio.fullyCached {
+                        telemetry.audioCacheHit = true
+                        telemetry.audioCacheFullyCached = true
+                        result.cachedAudioData = cachedAudio.data
+                    } else {
+                        telemetry.audioCacheHit = false
+                        telemetry.audioCacheFullyCached = cachedAudio?.fullyCached
+                    }
+                    result.queryTelemetry = telemetry
                     completion(.success(result))
                 } else {
                     completion(.failure(DictionaryQueryError.invalidResponse))
@@ -584,8 +669,20 @@ class YoudaoAPI {
                 guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     Logger.shared.error("API: JSON 根节点不是 object", error: nil)
                     if let (cached, _) = cachedInfo {
+                        telemetry.definitionUsedStaleFallback = true
                         var result = cached
-                        result.cachedAudioData = Database.shared.getWordAudio(word)
+                        let audioCacheStart = DispatchTime.now()
+                        let cachedAudio = Database.shared.getWordAudioInfo(word)
+                        telemetry.audioCacheLookupSeconds = elapsedSeconds(since: audioCacheStart)
+                        if let cachedAudio = cachedAudio, cachedAudio.fullyCached {
+                            telemetry.audioCacheHit = true
+                            telemetry.audioCacheFullyCached = true
+                            result.cachedAudioData = cachedAudio.data
+                        } else {
+                            telemetry.audioCacheHit = false
+                            telemetry.audioCacheFullyCached = cachedAudio?.fullyCached
+                        }
+                        result.queryTelemetry = telemetry
                         completion(.success(result))
                     } else {
                         completion(.failure(DictionaryQueryError.invalidResponse))
@@ -601,8 +698,20 @@ class YoudaoAPI {
                     if suggestions.isEmpty {
                         Logger.shared.log("API: 未找到 '\(word)' 且无拼写建议")
                         if let (cached, _) = cachedInfo {
+                            telemetry.definitionUsedStaleFallback = true
                             var result = cached
-                            result.cachedAudioData = Database.shared.getWordAudio(word)
+                            let audioCacheStart = DispatchTime.now()
+                            let cachedAudio = Database.shared.getWordAudioInfo(word)
+                            telemetry.audioCacheLookupSeconds = elapsedSeconds(since: audioCacheStart)
+                            if let cachedAudio = cachedAudio, cachedAudio.fullyCached {
+                                telemetry.audioCacheHit = true
+                                telemetry.audioCacheFullyCached = true
+                                result.cachedAudioData = cachedAudio.data
+                            } else {
+                                telemetry.audioCacheHit = false
+                                telemetry.audioCacheFullyCached = cachedAudio?.fullyCached
+                            }
+                            result.queryTelemetry = telemetry
                             completion(.success(result))
                         } else {
                             completion(.failure(DictionaryQueryError.notFound(input: word)))
@@ -610,8 +719,20 @@ class YoudaoAPI {
                     } else {
                         Logger.shared.log("API: 未找到 '\(word)', 返回 \(suggestions.count) 个拼写建议")
                         if let (cached, _) = cachedInfo {
+                            telemetry.definitionUsedStaleFallback = true
                             var result = cached
-                            result.cachedAudioData = Database.shared.getWordAudio(word)
+                            let audioCacheStart = DispatchTime.now()
+                            let cachedAudio = Database.shared.getWordAudioInfo(word)
+                            telemetry.audioCacheLookupSeconds = elapsedSeconds(since: audioCacheStart)
+                            if let cachedAudio = cachedAudio, cachedAudio.fullyCached {
+                                telemetry.audioCacheHit = true
+                                telemetry.audioCacheFullyCached = true
+                                result.cachedAudioData = cachedAudio.data
+                            } else {
+                                telemetry.audioCacheHit = false
+                                telemetry.audioCacheFullyCached = cachedAudio?.fullyCached
+                            }
+                            result.queryTelemetry = telemetry
                             completion(.success(result))
                         } else {
                             completion(.failure(DictionaryQueryError.notFoundWithSuggestions(input: word, suggestions: suggestions)))
@@ -722,12 +843,25 @@ class YoudaoAPI {
                     }.resume()
                 }
                 
+                result.queryTelemetry = telemetry
                 completion(.success(result))
             } catch {
                 Logger.shared.error("API: JSON解析错误", error: error)
                 if let (cached, _) = cachedInfo {
+                    telemetry.definitionUsedStaleFallback = true
                     var result = cached
-                    result.cachedAudioData = Database.shared.getWordAudio(word)
+                    let audioCacheStart = DispatchTime.now()
+                    let cachedAudio = Database.shared.getWordAudioInfo(word)
+                    telemetry.audioCacheLookupSeconds = elapsedSeconds(since: audioCacheStart)
+                    if let cachedAudio = cachedAudio, cachedAudio.fullyCached {
+                        telemetry.audioCacheHit = true
+                        telemetry.audioCacheFullyCached = true
+                        result.cachedAudioData = cachedAudio.data
+                    } else {
+                        telemetry.audioCacheHit = false
+                        telemetry.audioCacheFullyCached = cachedAudio?.fullyCached
+                    }
+                    result.queryTelemetry = telemetry
                     completion(.success(result))
                 } else {
                     completion(.failure(DictionaryQueryError.invalidResponse))
@@ -1262,6 +1396,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
     }
 
     private func performQuery(for word: String, recordInHistory: Bool = true) {
+        let queryStartedAt = DispatchTime.now()
         Logger.shared.log("View: 查询单词 '\(word)'")
         cancelFadeOut()
         userEditingWord = false
@@ -1271,7 +1406,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         searchField.isEditable = false
         showLoading(true)
 
-        YoudaoAPI.shared.query(word: word) { [weak self] result in
+        YoudaoAPI.shared.query(word: word, queryStartedAt: queryStartedAt) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.isQuerying = false
@@ -1408,6 +1543,33 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             showPlaceholderMessage("查询失败，请稍后重试")
         }
     }
+
+    private func fullyCachedDescription(_ fullyCached: Bool?) -> String {
+        guard let fullyCached = fullyCached else { return "无记录" }
+        return "fully_cached=\(fullyCached)"
+    }
+
+    private func logQueryTiming(word: String, telemetry: QueryTelemetry?, audioOutcome: String) {
+        guard let telemetry = telemetry else { return }
+
+        let total = formatSeconds(elapsedSeconds(since: telemetry.queryStartedAt))
+        let definitionText: String
+        if telemetry.definitionCacheHit == true {
+            definitionText = "释义缓存=命中(加载=\(formatSeconds(telemetry.definitionCacheLookupSeconds)), fully_cached=true)"
+        } else {
+            let fallbackText = telemetry.definitionUsedStaleFallback ? ", 使用残留缓存=true" : ""
+            definitionText = "释义缓存=未命中(\(fullyCachedDescription(telemetry.definitionCacheFullyCached)), API=\(formatSeconds(telemetry.definitionAPIDurationSeconds))\(fallbackText))"
+        }
+
+        let audioText: String
+        if telemetry.audioCacheHit == true {
+            audioText = "音频缓存=命中(加载=\(formatSeconds(telemetry.audioCacheLookupSeconds)), fully_cached=true)"
+        } else {
+            audioText = "音频缓存=未命中(\(fullyCachedDescription(telemetry.audioCacheFullyCached)), API=\(formatSeconds(telemetry.audioAPIDurationSeconds)))"
+        }
+
+        Logger.shared.log("QueryTiming: 单词 '\(word)' 总耗时=\(total); \(definitionText); \(audioText); \(audioOutcome)")
+    }
     
     func displayResult(_ data: YoudaoResult, word: String) {
         Logger.shared.log("View: 显示结果 - word: \(word), phonetic: \(data.ukphone ?? "nil"), definitions: \(data.definitions.count)")
@@ -1457,17 +1619,35 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
         // 构造音频 URL, 无论走缓存或网络都设为当前单词 (供喇叭按钮重播使用)
         currentAudioURL = URL(string: "https://dict.youdao.com/speech?word=\(word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word)&type=1")
 
-        if let cachedData = data.cachedAudioData {
+        var cachedAudioData = data.cachedAudioData
+        if cachedAudioData == nil, let telemetry = data.queryTelemetry, telemetry.audioCacheHit == nil {
+            let audioCacheStart = DispatchTime.now()
+            let cachedAudio = Database.shared.getWordAudioInfo(word)
+            telemetry.audioCacheLookupSeconds = elapsedSeconds(since: audioCacheStart)
+            if let cachedAudio = cachedAudio, cachedAudio.fullyCached {
+                telemetry.audioCacheHit = true
+                telemetry.audioCacheFullyCached = true
+                cachedAudioData = cachedAudio.data
+            } else {
+                telemetry.audioCacheHit = false
+                telemetry.audioCacheFullyCached = cachedAudio?.fullyCached
+            }
+        }
+
+        if let cachedData = cachedAudioData {
             Logger.shared.log("View: 使用缓存音频 \(cachedData.count) bytes")
             playButton.isHidden = false
             do {
                 audioPlayer = try AVAudioPlayer(data: cachedData)
                 audioPlayer?.delegate = self
-                audioPlayer?.play()
+                let didStart = audioPlayer?.play() ?? false
                 startPlayButtonPulseAnimation()
                 Logger.shared.log("View: 播放缓存音频")
+                logQueryTiming(word: word, telemetry: data.queryTelemetry,
+                               audioOutcome: didStart ? "界面开始播放音频音标" : "音频播放器未确认开始播放")
             } catch {
                 Logger.shared.error("View: 播放缓存音频失败", error: error)
+                logQueryTiming(word: word, telemetry: data.queryTelemetry, audioOutcome: "播放缓存音频失败")
                 searchField.isEditable = true
             }
         } else {
@@ -1476,7 +1656,7 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             playButton.isHidden = true
             audioLoadingIndicator.isHidden = false
             audioLoadingIndicator.startAnimation(nil)
-            downloadAndPlayAudio()
+            downloadAndPlayAudio(telemetry: data.queryTelemetry, word: word)
         }
     }
     
@@ -1715,17 +1895,18 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
             audioLoadingIndicator.isHidden = false
             audioLoadingIndicator.startAnimation(nil)
             searchField.isEditable = false
-            downloadAndPlayAudio(from: url)
+            downloadAndPlayAudio(from: url, word: displayedWord)
         }
     }
     
-    private func downloadAndPlayAudio() {
+    private func downloadAndPlayAudio(telemetry: QueryTelemetry? = nil, word: String? = nil) {
         guard let url = currentAudioURL else { return }
-        downloadAndPlayAudio(from: url)
+        downloadAndPlayAudio(from: url, telemetry: telemetry, word: word)
     }
     
-    private func downloadAndPlayAudio(from url: URL) {
+    private func downloadAndPlayAudio(from url: URL, telemetry: QueryTelemetry? = nil, word: String? = nil) {
         Logger.shared.log("View: 开始下载音频")
+        let audioAPIStart = DispatchTime.now()
         
         URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
             DispatchQueue.main.async {
@@ -1736,20 +1917,35 @@ class DictionaryViewController: NSViewController, NSTextFieldDelegate, NSTextVie
                 self.playButton.isHidden = false
                 
                 guard let data = data, error == nil else {
+                    telemetry?.audioAPIDurationSeconds = elapsedSeconds(since: audioAPIStart)
                     Logger.shared.error("View: 音频下载失败", error: error)
+                    if let word = word {
+                        self.logQueryTiming(word: word, telemetry: telemetry, audioOutcome: "音频下载失败")
+                    }
                     self.searchField.isEditable = true
                     return
                 }
+                telemetry?.audioAPIDurationSeconds = elapsedSeconds(since: audioAPIStart)
                 Logger.shared.log("View: 音频下载成功 \(data.count) bytes")
+                if let word = word {
+                    Database.shared.saveWordAudio(word, audioData: data)
+                }
                 
                 do {
                     self.audioPlayer = try AVAudioPlayer(data: data)
                     self.audioPlayer?.delegate = self
-                    self.audioPlayer?.play()
+                    let didStart = self.audioPlayer?.play() ?? false
                     self.startPlayButtonPulseAnimation()
                     Logger.shared.log("View: 开始播放音频")
+                    if let word = word {
+                        self.logQueryTiming(word: word, telemetry: telemetry,
+                                            audioOutcome: didStart ? "界面开始播放音频音标" : "音频播放器未确认开始播放")
+                    }
                 } catch {
                     Logger.shared.error("View: 播放失败", error: error)
+                    if let word = word {
+                        self.logQueryTiming(word: word, telemetry: telemetry, audioOutcome: "播放下载音频失败")
+                    }
                     self.searchField.isEditable = true
                 }
             }

@@ -89,3 +89,4 @@ Requires macOS 12+, Swift 5.7+, no third-party dependencies.
 ## License
 
 SwiftDict is released under MIT License. See [LICENSE](./LICENSE) for details.
+
